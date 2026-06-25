@@ -341,7 +341,179 @@ execute: (params, ctx) =>
 
 注意，以上都不是 JSON 解析。
 
-### 3. 最终如何变成系统进程
+### 3. 这段为什么是核心科技
+
+这段代码真正厉害的地方，是它没有把模型给的 `command` 直接扔给 shell，而是先把一次命令执行拆成 5 个受控阶段：
+
+```text
+params.command
+  -> resolvePath(workdir)
+  -> parse(command)
+  -> collect(AST)
+  -> ask(permission)
+  -> run(spawn + stream + timeout + truncate)
+```
+
+#### 3.1 `resolvePath`：不鼓励模型自己 `cd`
+
+shell prompt 明确要求模型用 `workdir`，不要写 `cd xxx && command`。源码里对应的是：
+
+```ts
+const cwd = params.workdir
+  ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
+  : instanceCtx.directory
+```
+
+这样做的效果是：
+
+- 工作目录由 harness 决定，不藏在命令字符串里。
+- 后续权限扫描知道命令实际在哪个目录运行。
+- Windows / POSIX / Cygwin 路径可以集中归一化。
+
+#### 3.2 `parse`：先把命令变成 AST，而不是正则硬猜
+
+源码用 `web-tree-sitter` 加载 bash / PowerShell grammar：
+
+```ts
+const tree = yield* parse(params.command, ps)
+```
+
+这一步把命令字符串变成语法树。后面的权限系统不是简单查字符串里有没有 `rm`，而是遍历 AST 里的 command 节点。
+
+直观理解：
+
+```text
+"cp a.txt /tmp/x"
+  -> command node
+     |- command_name: cp
+     |- word: a.txt
+     `- word: /tmp/x
+```
+
+有 AST 后，opencode 才能相对可靠地知道：
+
+- 命令名是什么。
+- 哪些 token 是参数。
+- 哪些 token 是重定向。
+- 哪些参数可能是路径。
+
+#### 3.3 `collect`：把命令归纳成权限请求
+
+`collect(...)` 做两类收集：
+
+```ts
+const scan = {
+  dirs: new Set<string>(),
+  patterns: new Set<string>(),
+  always: new Set<string>(),
+}
+```
+
+第一类是外部目录权限。比如命令访问了项目外路径：
+
+```text
+cat /etc/hosts
+cp file /tmp/out
+```
+
+源码会尝试从参数里解析路径：
+
+```ts
+const resolved = yield* argPath(arg, cwd, ps, shell)
+if (!resolved || containsPath(resolved, instance)) continue
+scan.dirs.add(dir)
+```
+
+第二类是 shell 命令权限。源码会把命令本身加入 pattern：
+
+```ts
+scan.patterns.add(source(node))
+scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
+```
+
+这就是为什么权限弹窗/规则不是只有粗糙的“允许 bash”，而可以具体到：
+
+```text
+permission: bash
+patterns: ["git status"]
+always:   ["git *"]
+```
+
+#### 3.4 `ask`：执行前卡权限，不是执行后补救
+
+`ask(ctx, scan)` 会先处理外部目录，再处理命令本身：
+
+```ts
+yield* ctx.ask({ permission: "external_directory", patterns: globs, ... })
+yield* ctx.ask({ permission: ShellID.ToolID, patterns, always, ... })
+```
+
+这一步还没 spawn 子进程。也就是说，危险命令会在系统执行前被权限层拦住。
+
+这也是 agent harness 和普通脚本执行器的关键差别：
+
+```text
+普通执行器：command -> spawn
+opencode： command -> AST scan -> permission ask -> spawn
+```
+
+#### 3.5 `shellEnv`：环境变量也走插件钩子
+
+执行前还会触发：
+
+```ts
+plugin.trigger("shell.env", { cwd, sessionID, callID }, { env: {} })
+```
+
+最后环境变量是：
+
+```ts
+{
+  ...process.env,
+  ...extra.env,
+}
+```
+
+这让插件可以给 shell 注入额外环境，但仍然经过统一入口。模型本身不直接控制这层。
+
+#### 3.6 `run`：真正执行，但仍然受控
+
+`run(...)` 不是简单 `await exec(command)`。它同时管理：
+
+- 子进程生命周期。
+- stdout/stderr 流式读取。
+- metadata 实时预览。
+- 超大输出落盘。
+- timeout。
+- 用户 abort。
+- 退出码。
+
+核心竞争逻辑是：
+
+```ts
+const exit = yield* Effect.raceAll([
+  handle.exitCode,
+  abort,
+  timeout,
+])
+```
+
+谁先发生就按谁处理：
+
+- 正常退出：返回 exit code。
+- 用户中断：`handle.kill({ forceKillAfter: "3 seconds" })`。
+- 超时：同样 kill，并在输出里写 `<shell_metadata>`。
+
+所以这一段的核心不是“会运行 bash”，而是：
+
+```text
+先理解命令
+再归纳权限
+再受控执行
+最后治理输出
+```
+
+### 4. 最终如何变成系统进程
 
 关键位置：`src/tool/shell.ts`
 
@@ -383,7 +555,7 @@ opencode shell tool
   它最终让系统 shell 去执行 "pwd"、"ls"、"git status" 等字符串
 ```
 
-### 4. 输出如何回到模型和 UI
+### 5. 输出如何回到模型和 UI
 
 `run(...)` 会同时处理：
 
@@ -572,6 +744,23 @@ opencode 主进程
   -> stdout 写回 opencode
   -> 父进程 wait 回收子进程
 ```
+
+本次用 `opencode 1.17.10` 重新动态复测，命令是让模型使用 bash tool 执行 `pwd`。`strace` 里能看到脱敏后的关键系统调用形态：
+
+```text
+execve("<opencode-bin>", ["opencode", "run", "..."], ...) = 0
+vfork(...)
+execve("<shell>", ["<shell>", "-c", "pwd"], ...) = 0
+exit_group(0)
+SIGCHLD si_status=0
+wait4(<shell-pid>, WEXITSTATUS == 0, WNOHANG, ...) = <shell-pid>
+```
+
+这次动态复测确认了 3 件事：
+
+- shell tool 最终确实落成一个 shell 子进程。
+- 普通执行路径是 shell `-c "pwd"`，不是 shell 去解析 JSON。
+- 子进程正常退出后由 opencode 父进程回收，输出再回到 tool result。
 
 实测结论和源码一致：
 

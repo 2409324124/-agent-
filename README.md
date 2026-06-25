@@ -21,73 +21,79 @@
 ## 一张图看懂 Harness
 
 ```text
-LLM / Provider
-  |
-  |  function/tool call
-  |  常见底层形态：
-  |  {
-  |    "name": "bash",
-  |    "arguments": "{\"command\":\"pwd\",\"description\":\"Show current dir\"}"
-  |  }
-  v
-AI SDK / provider adapter
-  |
-  |  解析 tool call，并根据 inputSchema 组织参数
-  v
-src/session/llm.ts
-  |
-  |  streamText({
-  |    tools: sortedTools,
-  |    activeTools,
-  |    toolChoice,
-  |    messages,
-  |    model
-  |  })
-  v
-src/session/prompt.ts
-  |
-  |  tools[item.id] = tool({
-  |    description,
-  |    inputSchema: jsonSchema(schema),
-  |    execute(args, options) { ... item.execute(args, ctx) ... }
-  |  })
-  v
-src/tool/tool.ts
-  |
-  |  Tool.define(...)
-  |    -> wrap(...)
-  |    -> Schema.decodeUnknownEffect(toolInfo.parameters)
-  |    -> execute(decoded, ctx)
-  v
-src/tool/shell.ts
-  |
-  |  execute(params, ctx)
-  |    -> resolve workdir
-  |    -> tree-sitter parse command
-  |    -> collect permission patterns
-  |    -> ctx.ask(...)
-  |    -> shellEnv(...)
-  |    -> run(...)
-  v
-ChildProcessSpawner.spawn(...)
-  |
-  |  ChildProcess.make(command, [], {
-  |    shell,
-  |    cwd,
-  |    env,
-  |    stdin: "ignore",
-  |    detached: true
-  |  })
-  v
-系统 shell 子进程
-  |
-  |  stdout/stderr -> stream collect -> truncate -> tool result
-  v
-src/session/processor.ts
-  |
-  |  tool-input-start / tool-call / tool-result
-  v
-Message tool part 写回会话
++---------------------------------------------------------------------+
+| 0. 模型输出的不是 Linux 命令，而是一次 tool call                    |
+|                                                                     |
+|    name: "bash"                                                     |
+|    arguments: "{\"command\":\"pwd\",\"description\":\"Show dir\"}"   |
++-------------------------------+-------------------------------------+
+                                |
+                                | JSON 字符串在 provider/AI SDK 边界解析
+                                v
++---------------------------------------------------------------------+
+| 1. AI SDK 工具外壳                                                  |
+|                                                                     |
+| src/session/llm.ts                                                  |
+|   streamText({ tools: sortedTools, ... })                           |
+|                                                                     |
+| src/session/prompt.ts                                               |
+|   tool({                                                            |
+|     inputSchema: jsonSchema(schema),                                |
+|     execute(args, options) { item.execute(args, ctx) }               |
+|   })                                                                |
++-------------------------------+-------------------------------------+
+                                |
+                                | args 已经是对象：{ command, ... }
+                                v
++---------------------------------------------------------------------+
+| 2. opencode Harness 包装层                                          |
+|                                                                     |
+| src/tool/tool.ts                                                    |
+|   Tool.define("bash", ...)                                          |
+|     `- wrap(...)                                                    |
+|        |- Schema.decodeUnknownEffect(parameters)                    |
+|        |- execute(decoded, ctx)                                     |
+|        `- truncate.output(...)                                      |
+|                                                                     |
+| ctx 里带着：sessionID / messageID / callID / ask / metadata / abort |
++-------------------------------+-------------------------------------+
+                                |
+                                | decoded 通过 schema 校验
+                                v
++---------------------------------------------------------------------+
+| 3. bash 工具自己的执行器                                            |
+|                                                                     |
+| src/tool/shell.ts                                                   |
+|   execute(params, ctx)                                              |
+|     |- resolve workdir                                              |
+|     |- tree-sitter parse command                                    |
+|     |- collect permission patterns                                  |
+|     |- ctx.ask(...)                                                 |
+|     `- run({ shell, command, cwd, env, timeout })                   |
++-------------------------------+-------------------------------------+
+                                |
+                                | 这里只处理 command，不解析 JSON
+                                v
++---------------------------------------------------------------------+
+| 4. 系统进程层                                                       |
+|                                                                     |
+| ChildProcessSpawner.spawn(...)                                      |
+|   `- ChildProcess.make(command, [], { shell, cwd, env })            |
+|                                                                     |
+| 等价理解：/bin/bash -c "pwd"                                        |
++-------------------------------+-------------------------------------+
+                                |
+                                | stdout/stderr
+                                v
++---------------------------------------------------------------------+
+| 5. 结果回流                                                         |
+|                                                                     |
+| shell output                                                        |
+|   -> Stream.decodeText(handle.all)                                  |
+|   -> preview / truncate / metadata                                  |
+|   -> src/session/processor.ts                                       |
+|   -> tool-result 写回 Message tool part                             |
++---------------------------------------------------------------------+
 ```
 
 如果只记一句话：

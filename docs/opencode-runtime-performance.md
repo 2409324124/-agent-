@@ -10,12 +10,104 @@
 
 结论先放前面：
 
-- 单次 CLI 冷启动不是轻量脚本级别，简单命令约 `180 MB` RSS，`debug info` 约 `310 MB` RSS。
-- 打包后的 opencode 二进制明显降低了源码 TS 入口的文件系统压力；同样跑 `debug info`，二进制约 `185` 次 file syscall，源码入口约 `8808` 次。
-- 空闲 server 约 `292 MB` RSS；源码 TS 入口启动 server 约 `363 MB` RSS。
-- 普通 HTTP 路径吞吐可接受：本机 `2000` 次 `/health` 请求约 `1.4s` 完成，RSS 增量约 `39 MB`。
-- 运行时状态的高风险点不在“TypeScript 语言本身”，而在 SSE/event stream 这类长连接订阅生命周期。短连压测 `2000` 次 `/event` + `/global/event` 后，RSS 增量约 `217 MB`，冷却 `60s` 后仍未回落。
-- 对 code agent 来说，性能上限通常被运行时状态、事件订阅、工具输出、会话历史、LLM streaming 和网络 provider 限制；TS/Bun 只是其中一层。
+- HTTP 框架基线可以到 `7.9k-8.8k RPS`，但这不是 code agent 的真实上限。
+- 多 session 状态读取约 `1.4k-1.7k RPS`；大量 session 后的列表查询会掉到 `68 RPS`。
+- session 创建写入约 `1.2k RPS`，对应进程 block write 约 `82 MB/s`。
+- 真正接近本地 code-agent 工具执行的 `POST /session/:id/shell` 上限约 `166-176 RPS`。并发从 `128` 拉到 `512` 不再涨吞吐，只会把 p99 从 `895ms` 拉到 `3.2s`。
+- shell 工具路径的主要开销不是网络，而是 session/message/part 写入、事件处理、shell 子进程创建和输出回写；实测 block write 稳定在 `50-54 MB/s`。
+- 进程用 `prlimit --as=10737418240` 设置了 `10 GiB` 地址空间上限；压测后 RSS 能从峰值 `1.28 GB` 冷却回 `522 MB`，FD 稳定 `21`。
+- SSE/event stream 仍是单独风险点：短连接反复打开/关闭时曾出现 RSS 不回落和 `MaxListenersExceededWarning`，这不是普通 HTTP RPS 能覆盖的问题。
+
+---
+
+## 生产口径压测结果
+
+这一轮不再用“几千个 curl”描述，而是直接给 RPS、延迟、网络吞吐和文件 IO。
+
+启动方式：
+
+```bash
+OPENCODE_SERVER_PASSWORD=bench \
+OPENCODE_DISABLE_MODELS_FETCH=1 \
+prlimit --as=10737418240 -- \
+opencode serve --pure --hostname 127.0.0.1 --port 19400 --print-logs --log-level ERROR
+```
+
+确认到的资源限制：
+
+```text
+AS address space limit: 10737418240 bytes
+NOFILE: 1048576
+```
+
+测试口径：
+
+- 进程：`opencode 1.17.13` 二进制 server。
+- 内存上限：`10 GiB` address space。
+- agent：`primary-controller`。
+- 多 agent/session 池：预创建 `2000` 个 session，压测时按 session 轮询。
+- 本地工具命令：`printf ok`。
+- 鉴权：Basic `opencode:bench`。
+- 观测：benchmark client 输出 RPS/p95/p99，`/proc/<pid>/io` 记录文件 IO，`/proc/net/dev` 记录 loopback 网络 IO。
+- 不测外部 LLM provider：`POST /session/:id/message` 会被模型 provider 限速、计费和网络延迟主导；本节重点是 opencode 本机 runtime 能承受的状态和工具 IO。
+
+绝对 RPS 表：
+
+| 路径 | 并发 | 数据规模 | RPS | p95 | p99 | 结论 |
+|---|---:|---:|---:|---:|---:|---|
+| `GET /health` | `128` | 无状态 | `8823` | `21ms` | `30ms` | HTTP 框架短请求基线 |
+| `GET /health` | `512` | 无状态 | `7877` | `78ms` | `112ms` | 高并发下仍接近 8k RPS |
+| `POST /session` | `128` | 持续创建 | `1223` | `123ms` | `174ms` | session 写入上限 |
+| `GET /session/:id` | `256` | `2000` session 池 | `1740` | `160ms` | `224ms` | 单 session 信息读取 |
+| `GET /session/:id/message?limit=20` | `256` | `2000` session 池 | `1384` | `204ms` | `239ms` | message list 读取 |
+| `GET /session?limit=50` | `256` | 大量 session 后 | `68` | `3791ms` | `3817ms` | 全局 session list 是明显瓶颈 |
+| `POST /session/:id/shell` | `128` | `2000` session 池 | `176` | `793ms` | `895ms` | 本地工具执行最佳点 |
+| `POST /session/:id/shell` | `256` | `2000` session 池 | `173` | `1523ms` | `1539ms` | 进入平台期，延迟翻倍 |
+| `POST /session/:id/shell` | `512` | `2000` session 池 | `166` | `3235ms` | `3243ms` | 过饱和，无吞吐收益 |
+
+IO 吞吐表：
+
+| 场景 | RPS | 响应 body 吞吐 | loopback 吞吐 | block write | 说明 |
+|---|---:|---:|---:|---:|---|
+| `GET /health`, 512 并发 | `7877` | `22.7 MB/s` | `28.8 MB/s` | `0 MB/s` | HTTP/network 基线 |
+| `POST /session`, 128 并发 | `1223` | `0.46 MB/s` | `1.25 MB/s` | `82 MB/s` | SQLite/WAL 写放大明显 |
+| `GET /session/:id`, 256 并发 | `1740` | `0.63 MB/s` | `1.58 MB/s` | `0 MB/s` | 主要是用户态读和 JSON 序列化 |
+| `GET /session/:id/message`, 256 并发 | `1384` | `0.003 MB/s` | `0.77 MB/s` | 近似 `0 MB/s` | 空消息列表，响应小 |
+| `GET /session?limit=50`, 256 并发 | `68` | `1.24 MB/s` | `0.17 MB/s` | 近似 `0 MB/s` | 状态规模变大后查询/投影慢 |
+| `POST /session/:id/shell`, 128 并发 | `176` | `0.15 MB/s` | `0.27 MB/s` | `54 MB/s` | 工具执行、part 更新、输出回写 |
+| `POST /session/:id/shell`, 256 并发 | `173` | `0.15 MB/s` | `0.28 MB/s` | `52 MB/s` | 吞吐不涨，排队变长 |
+| `POST /session/:id/shell`, 512 并发 | `166` | `0.14 MB/s` | `0.27 MB/s` | `50 MB/s` | 过饱和 |
+
+内存和 FD：
+
+| 场景 | 压测前 RSS | 压测后 RSS | 冷却后 RSS | FD |
+|---|---:|---:|---:|---:|
+| `GET /health`, 128 并发 | `348 MB` | `597 MB` | `332 MB` | `21` |
+| `POST /session`, 128 并发 | `341 MB` | `693 MB` | `384 MB` | `21` |
+| `POST /session/:id/shell`, 128 并发 | `473 MB` | `842 MB` | `483 MB` | `21` |
+| `POST /session/:id/shell`, 512 并发 | `489 MB` | `1284 MB` | `522 MB` | `21` |
+
+这一轮最重要的结论：
+
+```text
+opencode HTTP server 可以接近 8k RPS；
+opencode session 状态读大约 1.4k-1.7k RPS；
+opencode session 创建写大约 1.2k RPS；
+opencode 本地 shell 工具执行约 170 RPS。
+```
+
+也就是说，生产环境 code agent 的本机极限不能拿 `/health` 代表。真正要看的是：
+
+```text
+agent turn
+  -> session/message/part 写入
+  -> event publish
+  -> shell/tool 子进程或 MCP/tool 网络调用
+  -> output metadata 回写
+  -> session 状态查询/回放
+```
+
+在这个链路上，本机工具执行已经在 `~170 RPS` 进入平台期。继续增加并发只会拉高延迟，不会提高吞吐。
 
 ---
 

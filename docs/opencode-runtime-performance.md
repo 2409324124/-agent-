@@ -15,6 +15,7 @@
 - session 创建写入约 `1.2k RPS`，对应进程 block write 约 `82 MB/s`。
 - 真正接近本地 code-agent 工具执行的 `POST /session/:id/shell` 上限约 `166-176 RPS`。并发从 `128` 拉到 `512` 不再涨吞吐，只会把 p99 从 `895ms` 拉到 `3.2s`。
 - shell 工具路径的主要开销不是网络，而是 session/message/part 写入、事件处理、shell 子进程创建和输出回写；实测 block write 稳定在 `50-54 MB/s`。
+- 源码 TS 入口补测：direct shell tool 约 `166 RPS`；direct shell tool 加真实 4KB 文件写入约 `181 RPS`，写出 `2812` 个文件。这个路径仍不是模型驱动的完整 agent turn。
 - 进程用 `prlimit --as=10737418240` 设置了 `10 GiB` 地址空间上限；压测后 RSS 能从峰值 `1.28 GB` 冷却回 `522 MB`，FD 稳定 `21`。
 - SSE/event stream 仍是单独风险点：短连接反复打开/关闭时曾出现 RSS 不回落和 `MaxListenersExceededWarning`，这不是普通 HTTP RPS 能覆盖的问题。
 
@@ -108,6 +109,83 @@ agent turn
 ```
 
 在这个链路上，本机工具执行已经在 `~170 RPS` 进入平台期。继续增加并发只会拉高延迟，不会提高吞吐。
+
+---
+
+## 源码 TS 入口补测
+
+上面的生产 RPS 表主要用的是安装好的二进制：
+
+```text
+/home/miku/.opencode/bin/opencode
+opencode 1.17.13
+```
+
+为了回答“源码跑起来会怎样”，又用本地源码入口补测了一轮：
+
+```bash
+XDG_DATA_HOME=/tmp/opencode-source-homecfg-data \
+XDG_CACHE_HOME=/tmp/opencode-source-homecfg-cache \
+XDG_STATE_HOME=/tmp/opencode-source-homecfg-state \
+OPENCODE_SERVER_PASSWORD=bench \
+prlimit --as=10737418240 -- \
+bun run --cwd /srv/storage/projects/opencode-anomaly/packages/opencode \
+  --conditions=browser ./src/index.ts serve \
+  --pure --hostname 127.0.0.1 --port 19411 --print-logs --log-level ERROR
+```
+
+源码树：
+
+```text
+/srv/storage/projects/opencode-anomaly
+package version: 1.17.11
+entry: packages/opencode/src/index.ts
+```
+
+有效结果：
+
+| 路径 | 并发 | 数据规模 | RPS | p95 | p99 | 说明 |
+|---|---:|---:|---:|---:|---:|---|
+| source `POST /session` | `128` | 持续创建 | `1079` | `136ms` | `195ms` | 比二进制 `1223 RPS` 低约 `12%` |
+| source `GET /session/:id` | `256` | `2000` session 池 | `1698` | `163ms` | `225ms` | 和二进制 `1740 RPS` 接近 |
+| source direct `POST /session/:id/shell` | `128` | `1000` session 池，`printf ok` | `166` | `825ms` | `875ms` | 和二进制 shell 平台期接近 |
+| source direct `POST /session/:id/shell` | `128` | `2000` session 池，写 4KB 文件 | `181` | `753ms` | `768ms` | 写出 `2812` 个文件到 `/tmp/opencode-source-file-bench` |
+
+源码 direct shell + 文件写入的命令：
+
+```bash
+mkdir -p /tmp/opencode-source-file-bench
+head -c 4096 /dev/zero > /tmp/opencode-source-file-bench/file-$(date +%s%N)-$$
+```
+
+文件写入验证：
+
+```text
+files: 2812
+directory size: 12 MB
+opencode source data dir: 125 MB
+process block write delta: ~771 MB / 15.6s
+```
+
+这里要非常明确地区分两种路径：
+
+| 路径 | 是否模型驱动 | 是否真实工具执行 | 是否写 session storage | 是否写项目/文件 |
+|---|---:|---:|---:|---:|
+| direct `POST /session/:id/shell` | 否 | 是，执行 bash tool | 是 | 取决于 command，本次已写 `/tmp` 文件 |
+| `POST /session/:id/message` | 是 | 由模型决定 | 是 | 由模型/tool 决定 |
+
+本次源码入口的完整 `POST /session/:id/message` smoke test 没有得到有效 RPS。原因不是 HTTP 或工具执行慢，而是本地源码 `1.17.11` 和当前配置/模型映射不一致：
+
+```text
+ProviderModelNotFoundError:
+  Model not found: openai/gpt-5.5
+
+ProviderModelNotFoundError:
+  Model not found: xiaomi-token-plan-sgp/mimo-v2.5-pro
+  Did you mean: mimo-v2.5-pro?
+```
+
+因此，完整模型驱动 agent turn 不能用这棵源码树直接压 RPS；它会先卡在 provider/model resolution，而不是进入工具调用和文件 IO。要压完整 agent turn，需要先把源码树更新到和当前二进制/配置一致的版本，或修正本地 provider model 映射。
 
 ---
 

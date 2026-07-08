@@ -14,10 +14,134 @@
 - 多 session 状态读取约 `1.4k-1.7k RPS`；大量 session 后的列表查询会掉到 `68 RPS`。
 - session 创建写入约 `1.2k RPS`，对应进程 block write 约 `82 MB/s`。
 - 真正接近本地 code-agent 工具执行的 `POST /session/:id/shell` 上限约 `166-176 RPS`。并发从 `128` 拉到 `512` 不再涨吞吐，只会把 p99 从 `895ms` 拉到 `3.2s`。
+- 真实模型驱动 `opencode run` agent turn 远低于 direct shell：二进制 single-tool 稳定并发 `2` 时约 `0.158 turn/s`；并发 `4` 开始出现 `database is locked`。
+- 多 subagent 场景下，二进制 `2` 个 subagent、并发 `2` 时约 `0.056 turn/s`；`4` 个 subagent、并发 `1` 时约 `0.025 turn/s`。
+- 源码 TS 入口能跑通 `opencode run` 模型驱动路径，但并发 `2` 同样会出现 `database is locked`；源码 single-tool 成功样本约 `0.069-0.099 turn/s`，`2` subagent 单并发约 `0.031 turn/s`。
+- `opencode --mini` 不是可用的 10GiB 批量压测入口：二进制 mini 在 10GiB address-space limit 下输入 prompt 后出现 OpenTUI/JSC `RangeError: Out of memory` 或 Bun `Illegal instruction`；源码 mini 也出现 JSC memory exhaustion 或卡在 `BUILD` 不触发工具。
 - shell 工具路径的主要开销不是网络，而是 session/message/part 写入、事件处理、shell 子进程创建和输出回写；实测 block write 稳定在 `50-54 MB/s`。
 - 源码 TS 入口补测：direct shell tool 约 `166 RPS`；direct shell tool 加真实 4KB 文件写入约 `181 RPS`，写出 `2812` 个文件。这个路径仍不是模型驱动的完整 agent turn。
 - 进程用 `prlimit --as=10737418240` 设置了 `10 GiB` 地址空间上限；压测后 RSS 能从峰值 `1.28 GB` 冷却回 `522 MB`，FD 稳定 `21`。
 - SSE/event stream 仍是单独风险点：短连接反复打开/关闭时曾出现 RSS 不回落和 `MaxListenersExceededWarning`，这不是普通 HTTP RPS 能覆盖的问题。
+
+---
+
+## 模型驱动 agent turn 压测
+
+这一轮改成真实模型驱动路径，不再用 direct HTTP shell endpoint 代表 code agent：
+
+```bash
+prlimit --as=10737418240 -- \
+opencode run --auto \
+  -m xiaomi-token-plan-sgp/mimo-v2.5-pro \
+  --agent primary-controller \
+  --dir /tmp/opencode-model-turn-bench/... \
+  --format json \
+  'Use the bash/task tools..., verify files with cat...'
+```
+
+源码版入口：
+
+```bash
+prlimit --as=10737418240 -- \
+bun run --cwd /srv/storage/projects/opencode-anomaly/packages/opencode \
+  --conditions=browser ./src/index.ts run \
+  --dangerously-skip-permissions \
+  -m xiaomi-token-plan-sgp/mimo-v2.5-pro \
+  --agent primary-controller \
+  --dir /tmp/opencode-model-turn-bench/... \
+  --format json \
+  'Use the bash/task tools..., verify files with cat...'
+```
+
+可复跑脚本：
+
+```bash
+python3 bench/opencode_model_turn_bench.py \
+  --profile binary \
+  --mode subagents \
+  --subagents 2 \
+  --turns 4 \
+  --concurrency 2 \
+  --workdir /tmp/opencode-model-turn-bench/binary-subagents2-c2 \
+  --out-dir /tmp/opencode-model-turn-bench/results/binary-subagents2-c2
+```
+
+这个脚本采集：
+
+- `agent_turn_rps`：完整模型驱动 turn/s。
+- 每个 turn 的 wall time、成功/失败、session id。
+- JSON event 里的 `bash` / `task` / `write` / `todowrite` 工具次数。
+- 子 agent session id。
+- 文件内容验证结果。
+- `/proc/<pid>/io` 聚合读写量、峰值 RSS、进程数。
+- `/proc/net/dev` 的 loopback 和外部网卡收发字节。
+
+二进制 `opencode 1.17.13` 结果：
+
+| 场景 | turn | 并发 | 成功 | turn/s | p50 | p95/p99 | 峰值 RSS | 进程数峰值 | 工具调用 | 关键结论 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| single bash/write | `8` | `2` | `8/8` | `0.158` | `11.26s` | `15.41s` | `1.09 GB` | `8` | `bash=15, write=1` | 稳定上限口径 |
+| single bash/write | `8` | `4` | `6/8` | `0.240` 成功 turn/s | `11.35s` | `13.72s` | `2.09 GB` | `8` | `bash=11` | 出现 `database is locked`，不可视为稳定上限 |
+| `2` subagent/turn | `4` | `2` | `4/4` | `0.056` | `32.68s` | `38.18s` | `1.09 GB` | `4` | `task=8, bash=7, todowrite=3` | 稳定多 subagent 主口径 |
+| `4` subagent/turn | `2` | `1` | `2/2` | `0.025` | `39.06s` | `42.67s` | `586 MB` | `2` | `task=8, bash=4, todowrite=2` | 单 turn 内 subagent 加深后延迟接近 `40s` |
+
+二进制 IO：
+
+| 场景 | proc write_bytes | proc read_bytes | loopback RX/TX | 外部网卡 RX/TX |
+|---|---:|---:|---:|---:|
+| single, 并发 `2`, `8/8` | `64.9 MB` | `0 MB` | `1.07/1.07 MB` | `1.14/3.33 MB` |
+| single, 并发 `4`, `6/8` | `48.4 MB` | `0.01 MB` | `0.46/0.46 MB` | `0.67/2.20 MB` |
+| `2` subagent, 并发 `2`, `4/4` | `59.1 MB` | `0.02 MB` | `0.69/0.69 MB` | `1.40/6.10 MB` |
+| `4` subagent, 并发 `1`, `2/2` | `45.8 MB` | `0 MB` | `0.91/0.91 MB` | `1.61/5.28 MB` |
+
+源码 TS 入口结果：
+
+| 场景 | turn | 并发 | 成功 | turn/s | p50 | p95/p99 | 峰值 RSS | 工具调用 | 关键结论 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| single bash/write | `1` | `1` | `1/1` | `0.069` | `14.31s` | `14.31s` | `854 MB` | `bash=2` | 源码 `run` + 全模型名可用 |
+| single bash/write | `4` | `2` | `3/4` | `0.099` 成功 turn/s | `14.18s` | `14.93s` | `1.61 GB` | `bash=5` | 并发启动会撞 `database is locked` |
+| `2` subagent/turn | `2` | `1` | `2/2` | `0.031` | `32.12s` | `34.07s` | `860 MB` | `task=4, bash=3` | 源码多 subagent 单并发可用 |
+
+源码版注意点：
+
+- `run` 的跳过权限参数是 `--dangerously-skip-permissions`，不是新版二进制的 `--auto`。
+- `run` 必须用全模型名 `xiaomi-token-plan-sgp/mimo-v2.5-pro`；短名 `mimo-v2.5-pro` 会被解析成 `mimo-v2.5-pro/.` 并报 `ProviderModelNotFoundError`。
+- 源码 `run` 单并发能完成真实 bash/task 工具调用；并发进程主要风险仍是共享 SQLite 锁。
+
+这一轮的生产结论：
+
+```text
+direct shell endpoint: ~170 RPS
+model-driven single tool turn: ~0.16 turn/s stable, ~0.24 turn/s starts failing
+model-driven 2-subagent turn: ~0.056 turn/s stable
+model-driven 4-subagent turn: ~0.025 turn/s stable
+```
+
+所以 code agent 的生产上限不是 TypeScript/Bun HTTP 能跑多少 RPS，也不是 shell endpoint 能 fork 多少子进程，而是：
+
+```text
+模型调用延迟
+  + 父 session 写入
+  + task 子 session 创建和写入
+  + 共享 SQLite 锁竞争
+  + 工具调用结果回写
+  + 最终父 session 汇总
+```
+
+在当前配置下，多进程并发 `opencode run` 的第一个硬瓶颈是 `database is locked`，不是 10GiB 内存上限，也不是文件写入带宽。
+
+### mini TUI 压测失败记录
+
+为了满足“先调出 opencode 再交互输入”的口径，实际验证过 `opencode --mini`：
+
+- 普通手工/单次交互可以成功：mini UI 打开后输入 prompt，允许 `/tmp/*` 权限，模型调用 bash 写文件并 cat 验证。
+- 但作为 10GiB 批量压测入口失败：
+  - Python `pty.openpty()` 驱动二进制 mini，输入 prompt 后 Bun `1.3.14` 报 `panic: Illegal instruction`。
+  - `tmux` 驱动二进制 mini，输入 prompt 后 OpenTUI/JSC 报 `RangeError: Out of memory`，栈在 `editBufferGetText` / `onContentChange`。
+  - 源码 mini + 全模型名在 10GiB 下触发 `ASSERTION FAILED: MemoryExhaustion`。
+  - 源码 mini + 短模型名能进入 UI，但卡在 `BUILD`，没有观察到 bash/tool 调用，也没有写出文件。
+
+因此，`--mini` 可以作为人工 smoke test，但不能作为这轮 10GiB 极限压测的稳定 driver。正式 RPS/turn/s 采用 `opencode run --format json`，它仍然经过真实模型、真实工具、真实 session storage 和真实文件验证。
 
 ---
 
@@ -174,7 +298,9 @@ process block write delta: ~771 MB / 15.6s
 | direct `POST /session/:id/shell` | 否 | 是，执行 bash tool | 是 | 取决于 command，本次已写 `/tmp` 文件 |
 | `POST /session/:id/message` | 是 | 由模型决定 | 是 | 由模型/tool 决定 |
 
-本次源码入口的完整 `POST /session/:id/message` smoke test 没有得到有效 RPS。原因不是 HTTP 或工具执行慢，而是本地源码 `1.17.11` 和当前配置/模型映射不一致：
+这组 direct HTTP 结果之后，又补了 CLI `run` 模型驱动压测，见上面的“模型驱动 agent turn 压测”。需要区分两个历史现象：
+
+1. 旧的源码 HTTP `POST /session/:id/message` smoke test 没有得到有效 RPS。原因不是 HTTP 或工具执行慢，而是当时通过 HTTP message 路径触发了 provider/model resolution 问题：
 
 ```text
 ProviderModelNotFoundError:
@@ -185,7 +311,18 @@ ProviderModelNotFoundError:
   Did you mean: mimo-v2.5-pro?
 ```
 
-因此，完整模型驱动 agent turn 不能用这棵源码树直接压 RPS；它会先卡在 provider/model resolution，而不是进入工具调用和文件 IO。要压完整 agent turn，需要先把源码树更新到和当前二进制/配置一致的版本，或修正本地 provider model 映射。
+2. 当前源码 CLI `run` 路径可以用全模型名跑通：
+
+```bash
+bun run --cwd /srv/storage/projects/opencode-anomaly/packages/opencode \
+  --conditions=browser ./src/index.ts run \
+  --dangerously-skip-permissions \
+  -m xiaomi-token-plan-sgp/mimo-v2.5-pro \
+  --agent primary-controller \
+  --format json ...
+```
+
+因此，源码树现在可以做 CLI `run` 模型驱动压测；但 HTTP message 路径和 mini TUI 路径仍需单独看待，不能把它们的失败混同为工具执行能力失败。
 
 ---
 

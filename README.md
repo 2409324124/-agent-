@@ -4,6 +4,10 @@
 主分析版本：`opencode v1.17.9`  
 源码根目录占位：`<local-opencode>/packages/opencode`
 
+延伸阅读：
+
+- [opencode 运行期开销实测与 TypeScript 高性能开发笔记](docs/opencode-runtime-performance.md)
+
 这篇文档只解释一条核心链路：
 
 > 模型输出一个 tool call，里面带着 JSON 参数；opencode 如何把它变成一次真实工具执行，尤其是 shell 命令如何最终落到系统进程。

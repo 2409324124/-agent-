@@ -1,34 +1,35 @@
-# opencode Harness 源码解析：JSON 如何变成工具执行
+# opencode Harness 源码解析：从 Tool Call 到系统进程的执行链路
 
-相关文档：
+- **文档日期**：2026-06-24
+- **分析版本**：`opencode v1.17.9`
+- **源码根目录**：`<local-opencode>/packages/opencode`
+
+## 关联文档
 
 - [Codex Harness 源码解析：JSON 如何变成 shell 执行](./codex-harness-source-analysis.md)
 - [Codex Handler / Loop / Goal 源码解析：agent 如何持续做事](./codex-loop-handler-goal-analysis.md)
 - [Codex 后台监听机制解析：长任务为什么能挂着跑](./codex-background-exec-monitoring.md)
-
-日期：2026-06-24  
-主分析版本：`opencode v1.17.9`  
-源码根目录占位：`<local-opencode>/packages/opencode`
-
-延伸阅读：
-
 - [opencode 运行期开销实测与 TypeScript 高性能开发笔记](docs/opencode-runtime-performance.md)
-
-这篇文档只解释一条核心链路：
-
-> 模型输出一个 tool call，里面带着 JSON 参数；opencode 如何把它变成一次真实工具执行，尤其是 shell 命令如何最终落到系统进程。
-
-结论先放前面：
-
-- `Tool.define` 是 TypeScript 里的工具定义工厂和执行包装层。
-- `bash`、`read`、`edit`、`write` 等工具，本质上都是 JS/TS 对象；只有 shell tool 最后会创建系统子进程。
-- JSON 字符串到对象的解析发生在 provider / AI SDK / workflow bridge 边界；进入具体工具前，还会经过 `Tool.define` 的 Effect Schema 校验。
-- shell tool 不负责“把 JSON 变成工具调用”。它只接收已经解析并校验过的对象，然后取 `command` 字段执行。
-- opencode 强大的 harness 来自三层包装：AI SDK tool envelope、opencode `Tool.define` wrapper、具体工具自己的权限和执行逻辑。
 
 ---
 
-## 一张图看懂 Harness
+## 1. 架构概述 (Executive Summary)
+
+本文档解析 `opencode` 工具体系（Harness）的核心链路：大语言模型输出的 JSON 格式 Tool Call 如何经过反序列化、Schema 校验、权限拦截，最终转化为受控的操作系统级 Shell 进程执行。
+
+核心结论：
+
+1. **统一包装层**：`Tool.define` 是 TypeScript 实现的工具定义工厂与执行拦截器。
+2. **抽象本质**：`bash`、`read`、`edit`、`write` 等工具本质上是 JS/TS 对象；Shell 类工具在最终阶段创建系统子进程。
+3. **序列化边界**：JSON 字符串的反序列化发生在 Provider / AI SDK / Workflow Bridge 边界；进入具体工具逻辑前，由 `Tool.define` 强制执行 `Effect Schema` 校验。
+4. **Shell 工具定位**：Shell 工具接收已校验的上下文对象，并提取 `command` 字段进行受控执行。
+5. **三层安全闭环**：Harness 的生命周期控制由 `AI SDK Tool Envelope`、`opencode Tool Wrapper` 和具体工具执行器三层共同保障。
+
+---
+
+## 2. 核心链路视图
+
+### 2.1 一张图看懂 Harness：源码级全量路径
 
 ```text
 +---------------------------------------------------------------------+
@@ -112,7 +113,7 @@
 
 ---
 
-## 核心源码锚点
+## 3. 核心源码锚点矩阵
 
 | 层级 | 文件 | 作用 |
 |---|---|---|
@@ -125,9 +126,9 @@
 
 ---
 
-## JSON 到工具执行的源码路径
+## 4. 执行链路阶段拆解
 
-### 1. 模型看到的是 JSON Schema
+### 4.1 Schema 暴露与 AI SDK 桥接
 
 opencode 会把工具名和输入 schema 一起暴露给模型。
 
@@ -154,7 +155,7 @@ tools[item.id] = tool({
 
 模型在 provider 的 tool call 协议下按 schema 生成结构化参数。
 
-### 2. JSON 字符串在哪里 parse？
+### 4.2 反序列化边界
 
 在普通 AI SDK tool calling 路径里，JSON 参数解析通常由 provider adapter / AI SDK 处理，opencode 拿到 `execute(args)` 时已经是对象。
 
@@ -173,7 +174,7 @@ workflowModel.toolExecutor = async (toolName, argsJson, _requestID) => {
 }
 ```
 
-这段代码把事情说得很直白：
+该路径明确展示了参数形态转换：
 
 ```text
 argsJson: string
@@ -183,7 +184,7 @@ argsJson: string
 
 在“工具执行回调”边界，参数已经从 JSON 字符串变成 JS 对象。
 
-### 3. `prompt.ts` 再把执行交给 opencode tool
+### 4.3 AI SDK 回调进入 opencode Tool Context
 
 AI SDK 调用 `execute(args, options)` 后，opencode 会构造自己的 `Tool.Context`：
 
@@ -210,7 +211,7 @@ yield* plugin.trigger("tool.execute.after", ..., output)
 
 ---
 
-## `Tool.define` 包装层到底做什么
+## 5. `Tool.define` 核心拦截机制
 
 关键位置：`src/tool/tool.ts`
 
@@ -273,13 +274,13 @@ toolInfo.execute = (args, ctx) => {
 - metadata 更新。
 - agent 相关配置读取。
 
-这也是它强的地方：每个工具只写自己的业务逻辑，公共执行纪律由 wrapper 统一提供。
+每个工具只需要实现自身业务逻辑，公共执行纪律由 wrapper 统一提供。
 
 ---
 
-## Shell tool 为什么只是执行器
+## 6. Shell 工具的底层执行器
 
-### 1. shell 参数 schema
+### 6.1 Shell 参数 Schema
 
 关键位置：`src/tool/shell/prompt.ts`
 
@@ -312,7 +313,7 @@ shell tool 真正需要的参数只有这些：
 
 进入 `shell.ts` 时已经是对象。
 
-### 2. shell tool 的执行主线
+### 6.2 Shell Tool 执行主线
 
 关键位置：`src/tool/shell.ts`
 
@@ -339,7 +340,7 @@ execute: (params, ctx) =>
   })
 ```
 
-这里说明 shell tool 做的是：
+Shell Tool 的执行职责包括：
 
 1. 确定工作目录。
 2. 处理超时。
@@ -351,9 +352,9 @@ execute: (params, ctx) =>
 
 这段处理 shell 执行准备，不处理 JSON 解析。
 
-### 3. 这段为什么是核心科技
+### 6.3 受控执行阶段
 
-这段代码把一次命令执行拆成 5 个受控阶段：
+一次命令执行会被拆成 5 个受控阶段：
 
 ```text
 params.command
@@ -364,7 +365,7 @@ params.command
   -> run(spawn + stream + timeout + truncate)
 ```
 
-#### 3.1 `resolvePath`：不鼓励模型自己 `cd`
+#### 6.3.1 `resolvePath`：工作目录归一
 
 shell prompt 明确要求模型用 `workdir`，不要写 `cd xxx && command`。源码里对应的是：
 
@@ -380,7 +381,7 @@ const cwd = params.workdir
 - 后续权限扫描知道命令实际在哪个目录运行。
 - Windows / POSIX / Cygwin 路径可以集中归一化。
 
-#### 3.2 `parse`：把命令变成 AST
+#### 6.3.2 `parse`：命令转 AST
 
 源码用 `web-tree-sitter` 加载 bash / PowerShell grammar：
 
@@ -407,7 +408,7 @@ const tree = yield* parse(params.command, ps)
 - 哪些 token 是重定向。
 - 哪些参数可能是路径。
 
-#### 3.3 `collect`：把命令归纳成权限请求
+#### 6.3.3 `collect`：归纳权限请求
 
 `collect(...)` 做两类收集：
 
@@ -449,7 +450,7 @@ patterns: ["git status"]
 always:   ["git *"]
 ```
 
-#### 3.4 `ask`：执行前卡权限
+#### 6.3.4 `ask`：执行前权限拦截
 
 `ask(ctx, scan)` 会先处理外部目录，再处理命令本身：
 
@@ -460,14 +461,14 @@ yield* ctx.ask({ permission: ShellID.ToolID, patterns, always, ... })
 
 这一步还没 spawn 子进程。危险命令会在系统执行前被权限层拦住。
 
-这也是 agent harness 和普通脚本执行器的关键差别：
+agent harness 和普通脚本执行器的关键差别：
 
 ```text
 普通执行器：command -> spawn
 opencode： command -> AST scan -> permission ask -> spawn
 ```
 
-#### 3.5 `shellEnv`：环境变量也走插件钩子
+#### 6.3.5 `shellEnv`：环境变量插件钩子
 
 执行前还会触发：
 
@@ -486,7 +487,7 @@ plugin.trigger("shell.env", { cwd, sessionID, callID }, { env: {} })
 
 这让插件可以给 shell 注入额外环境，但仍然经过统一入口。模型本身不直接控制这层。
 
-#### 3.6 `run`：真正执行，但仍然受控
+#### 6.3.6 `run`：受控执行与生命周期管理
 
 `run(...)` 同时管理：
 
@@ -523,7 +524,7 @@ const exit = yield* Effect.raceAll([
 最后治理输出
 ```
 
-### 4. 最终如何变成系统进程
+### 6.4 系统进程创建
 
 关键位置：`src/tool/shell.ts`
 
@@ -545,7 +546,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
 const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
 ```
 
-这才是真正落到系统层的地方。
+这是命令落到系统层的入口。
 
 在 Linux/macOS 上可以理解为：
 
@@ -564,7 +565,7 @@ opencode shell tool
   它最终让系统 shell 去执行 "pwd"、"ls"、"git status" 等字符串
 ```
 
-### 5. 输出如何回到模型和 UI
+### 6.5 输出回收与治理
 
 `run(...)` 会同时处理：
 
@@ -589,7 +590,7 @@ opencode 用 truncation harness 控制超大输出，避免把完整日志直接
 
 ---
 
-## 工具事件如何写回会话
+## 7. 结果回流与上下文继承
 
 关键位置：`src/session/processor.ts`
 
@@ -641,7 +642,7 @@ yield* failToolCall(value.toolCallId, value.error)
 
 ---
 
-## 源码级回答：JSON 字符串如何执行
+## 8. 源码级执行路径汇总
 
 以一次 shell tool 为例：
 
@@ -701,7 +702,7 @@ yield* failToolCall(value.toolCallId, value.error)
     tool-result -> completeToolCall(...)
 ```
 
-这个路径说明：
+该路径说明：
 
 - JSON 解析和参数校验是 harness 前半段。
 - 权限和执行是具体工具中段。
@@ -709,11 +710,9 @@ yield* failToolCall(value.toolCallId, value.error)
 
 ---
 
-## 为什么说 opencode 的 harness 强
+## 9. Harness 生命周期架构优势
 
-强点不在 `spawn("bash")` 本身，很多程序都会调用 shell。
-
-真正强的是它把一次工具调用包成了可控生命周期：
+`spawn("bash")` 本身并不构成 Harness 的主要价值；关键在于 opencode 将一次工具调用封装为可控生命周期：
 
 ```text
 schema contract
@@ -742,7 +741,7 @@ harness 是一套“让模型安全、可观测、可中断地调用工具”的
 
 ---
 
-## 实测验证摘要
+## 10. 底层系统调用验证 (strace 探针)
 
 实测触发一次简单 shell tool，例如 `pwd`，系统层观察到的重点是：
 
@@ -780,7 +779,7 @@ shell tool 拿到 command 后只负责进程执行。
 
 ---
 
-## 版本差异只保留核心结论
+## 11. 版本差异与阅读路径
 
 对本文主线来说，`v1.15.1` 到 `v1.17.9` 的主线不变，变化集中在局部强化：
 

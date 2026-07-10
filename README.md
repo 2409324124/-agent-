@@ -1,5 +1,9 @@
 # opencode Harness 源码解析：JSON 如何变成工具执行
 
+相关文档：
+
+- [Codex Harness 源码解析：JSON 如何变成 shell 执行](./codex-harness-source-analysis.md)
+
 日期：2026-06-24  
 主分析版本：`opencode v1.17.9`  
 源码根目录占位：`<local-opencode>/packages/opencode`

@@ -4,6 +4,7 @@
 
 - [Codex Harness 源码解析：JSON 如何变成 shell 执行](./codex-harness-source-analysis.md)
 - [Codex Handler / Loop / Goal 源码解析：agent 如何持续做事](./codex-loop-handler-goal-analysis.md)
+- [Codex 后台监听机制解析：长任务为什么能挂着跑](./codex-background-exec-monitoring.md)
 
 日期：2026-06-24  
 主分析版本：`opencode v1.17.9`  

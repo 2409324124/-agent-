@@ -12,7 +12,7 @@
 
 ## 0. 最短结论
 
-Codex 不是把 JSON 直接扔给 bash。
+Codex 的工具链路是：
 
 ```text
 model function_call.arguments(JSON string)
@@ -125,7 +125,7 @@ ResponseItem::FunctionCall { name, arguments, call_id }
 
 ## 3. Codex 的真实 TDD/测试流程
 
-这里才是源码里的 test harness，不是 runtime 自动 TDD。
+源码里的 test harness 在这里；runtime 默认不会自动做 TDD。
 
 ### 3.1 官方要求
 
@@ -153,7 +153,7 @@ Prefer mount_sse_once
 Prefer wait_for_event
 ```
 
-所以 Codex 的 TDD 是源码开发者写“假模型响应”，驱动真实 agent loop。
+Codex 源码测试用“假模型响应”驱动真实 agent loop。
 
 ### 3.2 shell_command 测试的真实路径
 
@@ -260,7 +260,7 @@ Assert
   original_token_count exists
 ```
 
-这说明 `exec_command` 的 harness 测试覆盖终端协议元数据，不只是 stdout。
+这说明 `exec_command` 的 harness 测试覆盖终端协议元数据和 stdout。
 
 ### 3.5 实际要跑的命令
 
@@ -272,7 +272,7 @@ just test -p codex-core --test all shell_command_works
 just test -p codex-core --test all exec_command_reports_chunk_and_exit_metadata
 ```
 
-注意：
+运行方式：
 
 ```text
 不要直接 cargo test
@@ -283,9 +283,9 @@ just test -> cargo nextest run --no-fail-fast
 
 ## 4. runtime 是否自动 TDD？
 
-结论：不是。
+结论：默认不会。
 
-Codex runtime 的能力是“模型可以调用 shell 工具执行测试命令”，不是“每轮自动 TDD”。
+Codex runtime 提供的是“模型可以调用 shell 工具执行测试命令”的能力。每轮自动 TDD 由 prompt、用户要求或开发规范驱动。
 
 真正强制测试的是源码开发规范：
 
@@ -350,7 +350,7 @@ ConPTY/TTY behavior is not yet covered
 target intentionally limited to x86-64
 ```
 
-也就是说 remote Windows exec-server 有 smoke，但 TTY/ConPTY 还不是覆盖闭环。
+remote Windows exec-server 已有 smoke 覆盖，TTY/ConPTY 仍是未覆盖项。
 
 ### 5.4 compact 测试里有已知行为缺口
 
@@ -368,7 +368,7 @@ Update once pre-turn compaction includes incoming user input
 Update once context-overflow handling includes incoming user input
 ```
 
-这不是 shell 工具本身的问题，但属于 agent turn harness 的测试缺口。
+这个问题属于 agent turn harness 的测试缺口，和 shell 工具本身无关。
 
 ## 6. 动态验证
 

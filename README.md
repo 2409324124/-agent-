@@ -20,7 +20,7 @@
 
 结论先放前面：
 
-- `Tool.define` 不是 Linux 命令，也不是一堆可执行文件。它是 TypeScript 里的工具定义工厂和执行包装层。
+- `Tool.define` 是 TypeScript 里的工具定义工厂和执行包装层。
 - `bash`、`read`、`edit`、`write` 等工具，本质上都是 JS/TS 对象；只有 shell tool 最后会创建系统子进程。
 - JSON 字符串到对象的解析发生在 provider / AI SDK / workflow bridge 边界；进入具体工具前，还会经过 `Tool.define` 的 Effect Schema 校验。
 - shell tool 不负责“把 JSON 变成工具调用”。它只接收已经解析并校验过的对象，然后取 `command` 字段执行。
@@ -32,7 +32,7 @@
 
 ```text
 +---------------------------------------------------------------------+
-| 0. 模型输出的不是 Linux 命令，而是一次 tool call                    |
+| 0. 模型输出一次 tool call                                           |
 |                                                                     |
 |    name: "bash"                                                     |
 |    arguments: "{\"command\":\"pwd\",\"description\":\"Show dir\"}"   |
@@ -106,9 +106,9 @@
 +---------------------------------------------------------------------+
 ```
 
-如果只记一句话：
+核心链路：
 
-> JSON 不是 shell 解析的；shell 只是最终执行器。真正的 harness 是 `streamText({ tools })` + `Tool.define` + 具体工具执行器这三层。
+> JSON 参数在 provider / AI SDK / workflow bridge 边界解析；shell 只接收 `command` 字段执行。harness 的三层是 `streamText({ tools })`、`Tool.define`、具体工具执行器。
 
 ---
 
@@ -129,7 +129,7 @@
 
 ### 1. 模型看到的是 JSON Schema
 
-opencode 不只是把工具名告诉模型，还会把每个工具的输入 schema 暴露给模型。
+opencode 会把工具名和输入 schema 一起暴露给模型。
 
 关键位置：`src/session/prompt.ts`
 
@@ -152,7 +152,7 @@ tools[item.id] = tool({
 - `inputSchema`：给模型看的 JSON Schema。
 - `execute(args, options)`：模型触发工具调用后实际跑的回调。
 
-所以模型不是随便吐字符串，而是在 provider 支持 tool call 的协议下，按 schema 生成结构化参数。
+模型在 provider 的 tool call 协议下按 schema 生成结构化参数。
 
 ### 2. JSON 字符串在哪里 parse？
 
@@ -181,7 +181,7 @@ argsJson: string
   -> t.execute(parsedArgs, options)
 ```
 
-也就是说，在“工具执行回调”边界，参数已经从 JSON 字符串变成 JS 对象。
+在“工具执行回调”边界，参数已经从 JSON 字符串变成 JS 对象。
 
 ### 3. `prompt.ts` 再把执行交给 opencode tool
 
@@ -194,7 +194,7 @@ const result = yield* item.execute(args, ctx)
 yield* plugin.trigger("tool.execute.after", ..., output)
 ```
 
-这一步很关键。`args` 还没有直接进 shell，而是进入 opencode 的 tool wrapper。
+这一步把 `args` 交给 opencode 的 tool wrapper，shell 还没有开始执行。
 
 这里还塞进了 harness 需要的上下文：
 
@@ -206,7 +206,7 @@ yield* plugin.trigger("tool.execute.after", ..., output)
 - `metadata(...)`
 - `ask(...)`
 
-这就是为什么工具不是孤立函数。它能更新 UI、申请权限、响应中断、写回 metadata。
+工具通过这层上下文更新 UI、申请权限、响应中断、写回 metadata。
 
 ---
 
@@ -254,7 +254,7 @@ toolInfo.execute = (args, ctx) => {
 3. 校验成功后调用原始工具实现 `execute(decoded, ctx)`。
 4. 工具输出统一走截断逻辑，并把截断信息写入 metadata。
 
-所以 `Tool.define` 是一个边界层：
+`Tool.define` 的边界：
 
 ```text
 外部 unknown args
@@ -264,7 +264,7 @@ toolInfo.execute = (args, ctx) => {
   -> 统一截断/metadata/span
 ```
 
-它解决的问题不是“执行命令”，而是让所有工具都有同一套 harness 能力：
+它给所有工具补上同一套 harness 能力：
 
 - 参数校验。
 - 错误包装。
@@ -310,7 +310,7 @@ shell tool 真正需要的参数只有这些：
 }
 ```
 
-但进入 `shell.ts` 时已经是对象，不是原始 JSON 字符串。
+进入 `shell.ts` 时已经是对象。
 
 ### 2. shell tool 的执行主线
 
@@ -349,11 +349,11 @@ execute: (params, ctx) =>
 6. 注入环境变量。
 7. 调用 `run(...)`。
 
-注意，以上都不是 JSON 解析。
+这段处理 shell 执行准备，不处理 JSON 解析。
 
 ### 3. 这段为什么是核心科技
 
-这段代码真正厉害的地方，是它没有把模型给的 `command` 直接扔给 shell，而是先把一次命令执行拆成 5 个受控阶段：
+这段代码把一次命令执行拆成 5 个受控阶段：
 
 ```text
 params.command
@@ -380,7 +380,7 @@ const cwd = params.workdir
 - 后续权限扫描知道命令实际在哪个目录运行。
 - Windows / POSIX / Cygwin 路径可以集中归一化。
 
-#### 3.2 `parse`：先把命令变成 AST，而不是正则硬猜
+#### 3.2 `parse`：把命令变成 AST
 
 源码用 `web-tree-sitter` 加载 bash / PowerShell grammar：
 
@@ -388,7 +388,7 @@ const cwd = params.workdir
 const tree = yield* parse(params.command, ps)
 ```
 
-这一步把命令字符串变成语法树。后面的权限系统不是简单查字符串里有没有 `rm`，而是遍历 AST 里的 command 节点。
+这一步把命令字符串变成语法树。后面的权限系统通过遍历 AST 里的 command 节点识别命令和参数。
 
 直观理解：
 
@@ -441,7 +441,7 @@ scan.patterns.add(source(node))
 scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
 ```
 
-这就是为什么权限弹窗/规则不是只有粗糙的“允许 bash”，而可以具体到：
+权限弹窗/规则可以具体到：
 
 ```text
 permission: bash
@@ -449,7 +449,7 @@ patterns: ["git status"]
 always:   ["git *"]
 ```
 
-#### 3.4 `ask`：执行前卡权限，不是执行后补救
+#### 3.4 `ask`：执行前卡权限
 
 `ask(ctx, scan)` 会先处理外部目录，再处理命令本身：
 
@@ -458,7 +458,7 @@ yield* ctx.ask({ permission: "external_directory", patterns: globs, ... })
 yield* ctx.ask({ permission: ShellID.ToolID, patterns, always, ... })
 ```
 
-这一步还没 spawn 子进程。也就是说，危险命令会在系统执行前被权限层拦住。
+这一步还没 spawn 子进程。危险命令会在系统执行前被权限层拦住。
 
 这也是 agent harness 和普通脚本执行器的关键差别：
 
@@ -488,7 +488,7 @@ plugin.trigger("shell.env", { cwd, sessionID, callID }, { env: {} })
 
 #### 3.6 `run`：真正执行，但仍然受控
 
-`run(...)` 不是简单 `await exec(command)`。它同时管理：
+`run(...)` 同时管理：
 
 - 子进程生命周期。
 - stdout/stderr 流式读取。
@@ -514,7 +514,7 @@ const exit = yield* Effect.raceAll([
 - 用户中断：`handle.kill({ forceKillAfter: "3 seconds" })`。
 - 超时：同样 kill，并在输出里写 `<shell_metadata>`。
 
-所以这一段的核心不是“会运行 bash”，而是：
+这一段的核心流程：
 
 ```text
 先理解命令
@@ -556,12 +556,11 @@ ChildProcess.make("pwd", [], { shell: "/bin/bash", cwd: "..." })
   -> stdout/stderr 被 opencode 收集
 ```
 
-所以 shell tool 和 Linux 常用命令的关系是：
+shell tool 和 Linux 常用命令的关系：
 
 ```text
 opencode shell tool
-  不是 pwd/ls/git 这些命令本身
-  而是一个 TS 工具包装器
+  是一个 TS 工具包装器
   它最终让系统 shell 去执行 "pwd"、"ls"、"git status" 等字符串
 ```
 
@@ -586,7 +585,7 @@ child process output
   -> return ExecuteResult
 ```
 
-这就是为什么 opencode 能避免超大输出直接把上下文撑爆：输出不是简单拼接后无脑塞回模型，而是经过 truncation harness。
+opencode 用 truncation harness 控制超大输出，避免把完整日志直接塞回模型上下文。
 
 ---
 
@@ -629,7 +628,7 @@ yield* completeToolCall(value.toolCallId, output)
 yield* failToolCall(value.toolCallId, value.error)
 ```
 
-所以完整闭环是：
+完整闭环：
 
 ```text
 模型请求工具
@@ -712,7 +711,7 @@ yield* failToolCall(value.toolCallId, value.error)
 
 ## 为什么说 opencode 的 harness 强
 
-强点不在“它会调用 shell”。很多程序都会 `spawn("bash")`。
+强点不在 `spawn("bash")` 本身，很多程序都会调用 shell。
 
 真正强的是它把一次工具调用包成了可控生命周期：
 
@@ -732,14 +731,14 @@ schema contract
 具体表现：
 
 - 模型不能随便给参数，参数必须过 schema。
-- 工具执行前可以申请权限，而不是直接运行。
+- 工具执行前先申请权限，权限通过后再运行。
 - 工具执行中可以持续更新 metadata，让 UI 看到进度。
 - 用户 abort 或 timeout 可以杀掉进程。
 - 输出过大时保存到文件，只把截断结果回传。
 - tool call/result 都会被 processor 写入会话，后续模型能继续基于结果推理。
 - 插件工具也能进入同一套执行生命周期。
 
-这就是 harness：不是一个命令，而是一套“让模型安全、可观测、可中断地调用工具”的运行框架。
+harness 是一套“让模型安全、可观测、可中断地调用工具”的运行框架。
 
 ---
 
@@ -769,7 +768,7 @@ wait4(<shell-pid>, WEXITSTATUS == 0, WNOHANG, ...) = <shell-pid>
 这次动态复测确认了 3 件事：
 
 - shell tool 最终确实落成一个 shell 子进程。
-- 普通执行路径是 shell `-c "pwd"`，不是 shell 去解析 JSON。
+- 普通执行路径是 shell `-c "pwd"`；JSON 解析发生在工具执行边界之前。
 - 子进程正常退出后由 opencode 父进程回收，输出再回到 tool result。
 
 实测结论和源码一致：
@@ -783,7 +782,7 @@ shell tool 拿到 command 后只负责进程执行。
 
 ## 版本差异只保留核心结论
 
-对本文主线来说，`v1.15.1` 到 `v1.17.9` 的差异不是“架构换了”，而是局部强化：
+对本文主线来说，`v1.15.1` 到 `v1.17.9` 的主线不变，变化集中在局部强化：
 
 - `Tool.define` + Effect Schema 这条主线仍然存在。
 - `streamText({ tools })` 仍然是工具调用边界。
@@ -791,7 +790,7 @@ shell tool 拿到 command 后只负责进程执行。
 - 新版强化了错误类型、事件桥接、输出截断和后台任务处理。
 - 旧 Go 版更像“工具内部自己 `json.Unmarshal`”，新版把参数解析/校验前移到了 AI SDK/schema/harness 边界。
 
-因此，理解新版 opencode 不应该从“shell 如何 parse JSON”入手，而应该从：
+因此，理解新版 opencode 要从这三层入手：
 
 ```text
 AI SDK tool envelope

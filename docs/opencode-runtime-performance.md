@@ -10,18 +10,18 @@
 
 结论先放前面：
 
-- HTTP 框架基线可以到 `7.9k-8.8k RPS`，但这不是 code agent 的真实上限。
+- HTTP 框架基线可以到 `7.9k-8.8k RPS`；code agent 的真实上限要看 agent turn 链路。
 - 多 session 状态读取约 `1.4k-1.7k RPS`；大量 session 后的列表查询会掉到 `68 RPS`。
 - session 创建写入约 `1.2k RPS`，对应进程 block write 约 `82 MB/s`。
 - 真正接近本地 code-agent 工具执行的 `POST /session/:id/shell` 上限约 `166-176 RPS`。并发从 `128` 拉到 `512` 不再涨吞吐，只会把 p99 从 `895ms` 拉到 `3.2s`。
 - 真实模型驱动 `opencode run` agent turn 远低于 direct shell：二进制 single-tool 稳定并发 `2` 时约 `0.158 turn/s`；并发 `4` 开始出现 `database is locked`。
 - 多 subagent 场景下，二进制 `2` 个 subagent、并发 `2` 时约 `0.056 turn/s`；`4` 个 subagent、并发 `1` 时约 `0.025 turn/s`。
 - 源码 TS 入口能跑通 `opencode run` 模型驱动路径，但并发 `2` 同样会出现 `database is locked`；源码 single-tool 成功样本约 `0.069-0.099 turn/s`，`2` subagent 单并发约 `0.031 turn/s`。
-- `opencode --mini` 不是可用的 10GiB 批量压测入口：二进制 mini 在 10GiB address-space limit 下输入 prompt 后出现 OpenTUI/JSC `RangeError: Out of memory` 或 Bun `Illegal instruction`；源码 mini 也出现 JSC memory exhaustion 或卡在 `BUILD` 不触发工具。
-- shell 工具路径的主要开销不是网络，而是 session/message/part 写入、事件处理、shell 子进程创建和输出回写；实测 block write 稳定在 `50-54 MB/s`。
-- 源码 TS 入口补测：direct shell tool 约 `166 RPS`；direct shell tool 加真实 4KB 文件写入约 `181 RPS`，写出 `2812` 个文件。这个路径仍不是模型驱动的完整 agent turn。
+- `opencode --mini` 不适合作为 10GiB 批量压测入口：二进制 mini 在 10GiB address-space limit 下输入 prompt 后出现 OpenTUI/JSC `RangeError: Out of memory` 或 Bun `Illegal instruction`；源码 mini 也出现 JSC memory exhaustion 或卡在 `BUILD` 不触发工具。
+- shell 工具路径的主要开销集中在 session/message/part 写入、事件处理、shell 子进程创建和输出回写；实测 block write 稳定在 `50-54 MB/s`。
+- 源码 TS 入口补测：direct shell tool 约 `166 RPS`；direct shell tool 加真实 4KB 文件写入约 `181 RPS`，写出 `2812` 个文件。这个路径仍低于完整模型驱动 agent turn。
 - 进程用 `prlimit --as=10737418240` 设置了 `10 GiB` 地址空间上限；压测后 RSS 能从峰值 `1.28 GB` 冷却回 `522 MB`，FD 稳定 `21`。
-- SSE/event stream 仍是单独风险点：短连接反复打开/关闭时曾出现 RSS 不回落和 `MaxListenersExceededWarning`，这不是普通 HTTP RPS 能覆盖的问题。
+- SSE/event stream 仍是单独风险点：短连接反复打开/关闭时曾出现 RSS 不回落和 `MaxListenersExceededWarning`，普通 HTTP RPS 覆盖不到这个问题。
 
 ---
 
@@ -104,7 +104,7 @@ python3 bench/opencode_model_turn_bench.py \
 
 源码版注意点：
 
-- `run` 的跳过权限参数是 `--dangerously-skip-permissions`，不是新版二进制的 `--auto`。
+- `run` 的跳过权限参数是 `--dangerously-skip-permissions`；新版二进制使用 `--auto`。
 - `run` 必须用全模型名 `xiaomi-token-plan-sgp/mimo-v2.5-pro`；短名 `mimo-v2.5-pro` 会被解析成 `mimo-v2.5-pro/.` 并报 `ProviderModelNotFoundError`。
 - 源码 `run` 单并发能完成真实 bash/task 工具调用；并发进程主要风险仍是共享 SQLite 锁。
 
@@ -117,7 +117,7 @@ model-driven 2-subagent turn: ~0.056 turn/s stable
 model-driven 4-subagent turn: ~0.025 turn/s stable
 ```
 
-所以 code agent 的生产上限不是 TypeScript/Bun HTTP 能跑多少 RPS，也不是 shell endpoint 能 fork 多少子进程，而是：
+code agent 的生产上限取决于：
 
 ```text
 模型调用延迟
@@ -128,7 +128,7 @@ model-driven 4-subagent turn: ~0.025 turn/s stable
   + 最终父 session 汇总
 ```
 
-在当前配置下，多进程并发 `opencode run` 的第一个硬瓶颈是 `database is locked`，不是 10GiB 内存上限，也不是文件写入带宽。
+在当前配置下，多进程并发 `opencode run` 的第一个硬瓶颈是 `database is locked`。10GiB 内存上限和文件写入带宽还没先撞上。
 
 ### mini TUI 压测失败记录
 
@@ -147,7 +147,7 @@ model-driven 4-subagent turn: ~0.025 turn/s stable
 
 ## 生产口径压测结果
 
-这一轮不再用“几千个 curl”描述，而是直接给 RPS、延迟、网络吞吐和文件 IO。
+这一轮直接给 RPS、延迟、网络吞吐和文件 IO。
 
 启动方式：
 
@@ -221,7 +221,7 @@ opencode session 创建写大约 1.2k RPS；
 opencode 本地 shell 工具执行约 170 RPS。
 ```
 
-也就是说，生产环境 code agent 的本机极限不能拿 `/health` 代表。真正要看的是：
+生产环境 code agent 的本机极限要看这条链路：
 
 ```text
 agent turn
@@ -300,7 +300,7 @@ process block write delta: ~771 MB / 15.6s
 
 这组 direct HTTP 结果之后，又补了 CLI `run` 模型驱动压测，见上面的“模型驱动 agent turn 压测”。需要区分两个历史现象：
 
-1. 旧的源码 HTTP `POST /session/:id/message` smoke test 没有得到有效 RPS。原因不是 HTTP 或工具执行慢，而是当时通过 HTTP message 路径触发了 provider/model resolution 问题：
+1. 旧的源码 HTTP `POST /session/:id/message` smoke test 没有得到有效 RPS。当时 HTTP message 路径触发了 provider/model resolution 问题：
 
 ```text
 ProviderModelNotFoundError:
@@ -448,7 +448,7 @@ bun run --cwd /srv/storage/projects/opencode-anomaly/packages/opencode --conditi
 1 getsockname
 ```
 
-这类 debug 命令不是 LLM 请求，不代表真实 agent 调模型时的网络开销。真实 agent 路径会多出 provider streaming、重试、MCP/tool 网络调用和日志传输。
+这类 debug 命令属于本地诊断，不代表真实 agent 调模型时的网络开销。真实 agent 路径会多出 provider streaming、重试、MCP/tool 网络调用和日志传输。
 
 ---
 
@@ -495,7 +495,7 @@ OPENCODE_DISABLE_MODELS_FETCH=1 opencode serve --pure --hostname 127.0.0.1 --por
 | FD | `21` |
 | TCP | `1 LISTEN` + `2000 TIME-WAIT` |
 
-这个结果说明普通短 HTTP 请求不是主要问题。FD 没增长，连接关闭后进入内核 `TIME-WAIT`，用户态进程没有明显句柄泄露。
+这个结果说明普通短 HTTP 请求压力不大。FD 没增长，连接关闭后进入内核 `TIME-WAIT`，用户态进程没有明显句柄泄露。
 
 ---
 
@@ -520,12 +520,12 @@ OPENCODE_DISABLE_MODELS_FETCH=1 opencode serve --pure --hostname 127.0.0.1 --por
 
 关键现象：
 
-- FD 一直稳定，说明不是传统“文件描述符没关”的泄露。
+- FD 一直稳定，传统“文件描述符没关”的泄露迹象不明显。
 - TCP 最终只剩 `LISTEN`，说明连接关闭本身被内核回收了。
 - RSS 不但没有回落，冷却后还继续上升。
 - server 输出了 `MaxListenersExceededWarning`，提示同一个事件对象上累计了过多 listener。
 
-这类现象更像“用户态订阅/队列/Effect fiber 没完整释放”，不是 socket 没关。
+这类现象更像“用户态订阅/队列/Effect fiber 没完整释放”，socket 未关闭的迹象不明显。
 
 ---
 
@@ -547,7 +547,7 @@ after_sleep=30s  rss_mb=4922
 process exited with code 134
 ```
 
-同时没有观察到明显 `CLOSE_WAIT`，也没有发现内核 OOM 记录。这进一步支持一个判断：问题更接近运行时对象保留或后台 fiber/listener 生命周期问题，而不是底层网络连接没有 close。
+同时没有观察到明显 `CLOSE_WAIT`，也没有发现内核 OOM 记录。这进一步支持一个判断：问题更接近运行时对象保留或后台 fiber/listener 生命周期问题，底层网络连接未关闭的可能性较低。
 
 ---
 
@@ -583,7 +583,7 @@ allBounded(events, capacity)
   -> finalizer: unsubscribe + Queue.shutdown(queue)
 ```
 
-所以修复方向不是“把 TS 改成别的语言”，而是让 server SSE handler 复用 bounded stream helper，或至少做到：
+修复方向应落在 server SSE handler：复用 bounded stream helper，或至少做到：
 
 - 用 bounded/dropping/sliding queue 替代 unbounded queue。
 - 连接断开时同时 `unsubscribe` 和 `Queue.shutdown`。
@@ -602,14 +602,14 @@ allBounded(events, capacity)
 | 打包二进制 | 文件 IO 低，启动更快 | CLI 分发、常驻 server、生产使用 |
 | 长时间 agent runtime | 瓶颈转向内存状态和流生命周期 | code agent、IDE agent、MCP host |
 
-对 code agent 来说，真正需要优化的不是“语言是否是 TypeScript”这个抽象问题，而是这些具体点：
+对 code agent 来说，真正需要优化的是这些具体点：
 
 - 不要在热路径频繁动态加载大量模块。
 - 长连接、SSE、watcher、event bus 必须有明确生命周期。
 - queue 默认不要 unbounded，除非能证明生产速率永远小于消费速率。
 - tool output 要分层存储：内存里只保留摘要和索引，大输出落盘或外部 blob。
 - session history 要有截断、压缩、分页和 lazy load。
-- LLM streaming 要把网络背压传递到内部队列，而不是无界缓存。
+- LLM streaming 要把网络背压传递到内部队列，避免无界缓存。
 - 观测指标要覆盖 RSS、heap、FD、listener count、queue depth、event lag。
 
 ---
@@ -632,6 +632,6 @@ allBounded(events, capacity)
 
 所以回答“TypeScript 的性能上限够不够 code agent 用”：
 
-> 够，但前提是像写高性能服务一样写 TS：打包运行、控制队列、关闭订阅、传递背压、限制内存态，而不是把运行时状态都挂在无界 event/fiber/stream 上。
+> 够，但前提是像写高性能服务一样写 TS：打包运行、控制队列、关闭订阅、传递背压、限制内存态，避免把运行时状态挂在无界 event/fiber/stream 上。
 
 如果只看语言，容易误判；如果看 runtime 生命周期，问题会具体很多。

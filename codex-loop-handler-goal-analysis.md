@@ -12,10 +12,10 @@
 
 先说结论：
 
-- `handler` 不是 Linux 命令，也不是一个个外部可执行文件。它是 Rust 里实现 `ToolExecutor` 的工具适配器。
+- `handler` 是 Rust 里实现 `ToolExecutor` 的工具适配器。
 - 真正的 agent loop 不在某个“神秘自我意识模块”里，而在 `run_turn` / `try_run_sampling_request` 的双层循环里。
 - `needs_follow_up` 是工具闭环的关键开关。模型一旦发出 tool call，Codex 执行工具，把结果写进 history，然后再发下一次 sampling request。
-- `/goal` 不是普通聊天命令那么简单。TUI 有 slash 入口，app-server 有 `thread/goal/*` 协议，state DB 持久化目标，goal extension 再把 `get_goal/create_goal/update_goal` 暴露给模型。
+- `/goal` 串起 TUI slash 入口、app-server `thread/goal/*` 协议、state DB 持久化目标，以及 goal extension 暴露给模型的 `get_goal/create_goal/update_goal`。
 - “自我决策”本质是：模型决定下一步输出什么，运行时负责把状态、工具、权限、目标、结果稳稳地接回下一轮模型输入。
 
 ## 1. 一张总图
@@ -88,7 +88,7 @@
   run_turn continues and samples model again
 ```
 
-这个图里最容易误解的点是：`ToolRouter` 不负责执行，`ToolRegistry` 不负责业务，`handler` 才是工具自己的执行入口。
+这个图里最容易误解的点：`ToolRouter` 只建调用对象，`ToolRegistry` 只分发，`handler` 才是工具自己的执行入口。
 
 ## 2. Handler 是什么
 
@@ -138,7 +138,7 @@ ExecCommandHandler::handle_call(invocation)
 - `with_updated_hook_input`：hook 如果改写输入，如何还原成新的 invocation。
 - telemetry / diff consumer：观测和流式参数 diff。
 
-所以 handler 不是“工具本身的名字”，也不是系统命令。它是这层结构：
+handler 所在的位置：
 
 ```text
 tool spec     : 告诉模型工具叫什么、参数 schema 是什么
@@ -160,7 +160,7 @@ GoalToolExecutor
   -> 不启动进程，读写 goal 状态库，然后发 goal update 事件
 ```
 
-这就是边界：只有 shell/exec 这类 handler 会落到系统进程。绝大多数工具只是 Rust 逻辑。
+边界很清楚：只有 shell/exec 这类 handler 会落到系统进程。绝大多数工具只执行 Rust 逻辑。
 
 ## 3. JSON 字符串在哪里变成参数
 
@@ -184,7 +184,7 @@ ToolCall {
 }
 ```
 
-注意：这里没有 `serde_json::from_str`。它只是把东西装进 `ToolCall`。
+这里没有 `serde_json::from_str`。`ToolRouter` 只把东西装进 `ToolCall`。
 
 真正 parse 在具体 handler：
 
@@ -205,7 +205,7 @@ update_plan:
   EventMsg::PlanUpdate(args)
 ```
 
-所以可以把边界画成这样：
+解析边界：
 
 ```text
 model JSON string
@@ -228,7 +228,7 @@ tool-specific execution
 
 这也解释了为什么 schema 边界重要：模型侧看到的是 tool spec / JSON schema，运行时侧最终靠 handler 的强类型反序列化兜底。schema 是“给模型看的合同”，handler parse 是“运行时真的验收”。
 
-## 4. Loop 工程：两个循环，不是一团 while true
+## 4. Loop 工程：两个循环
 
 源码锚点：
 
@@ -363,11 +363,11 @@ ToolRouter::build_tool_call(item)
               output.needs_follow_up = true
 ```
 
-这就是“工具调用之后为什么模型会继续”的具体机制：handler 的返回值最后会写成 `FunctionCallOutput`，而 `needs_follow_up=true` 会让外层 `run_turn` 再跑一次 sampling request。
+工具调用之后模型会继续，靠的是这个机制：handler 的返回值最后写成 `FunctionCallOutput`，`needs_follow_up=true` 让外层 `run_turn` 再跑一次 sampling request。
 
 ## 5. “自我决策”是怎么实现的
 
-这里要把话说实：Codex 不是在 Rust 里写了一个“思考算法”去决定下一步做什么。下一步要发消息、调工具、继续还是停，主要来自模型的下一个 `ResponseItem`。
+这里要把话说实：下一步要发消息、调工具、继续还是停，主要来自模型的下一个 `ResponseItem`。Rust runtime 负责约束、执行和回灌。
 
 运行时做的是约束和闭环：
 
@@ -402,7 +402,7 @@ ToolRouter::build_tool_call(item)
               no  -> finish turn
 ```
 
-所以所谓“自我决策”分两层：
+“自我决策”分两层：
 
 ```text
 模型层：
@@ -417,7 +417,7 @@ ToolRouter::build_tool_call(item)
   决定 goal 是否继续拉起新 turn。
 ```
 
-这套工程强的地方不是某一个点，而是“每一步都能回到 transcript”。工具不是旁路执行完就结束，而是变成模型下一轮可见的事实。
+这套工程强在“每一步都能回到 transcript”。工具结果会变成模型下一轮可见的事实。
 
 ## 6. `/goal` 是什么
 
@@ -494,7 +494,7 @@ notifications
   "thread/goal/cleared"
 ```
 
-所以 `/goal` 不是直接给模型的一句话，也不是某个 shell 命令。它先改变 thread 的持久 goal 状态。
+`/goal` 先改变 thread 的持久 goal 状态，再由 goal runtime 把目标上下文接进后续 turn。
 
 ### 6.2 goal 的状态模型
 
@@ -538,7 +538,7 @@ account_thread_goal_usage(...)
   如果 tokens_used >= token_budget，把 active 推到 budget_limited
 ```
 
-这说明 `/goal` 是有账本的，不只是 UI 上显示一个标题。
+这说明 `/goal` 有账本，UI 上显示的标题只是表层。
 
 ### 6.3 goal 也是模型可调用工具
 
@@ -589,7 +589,7 @@ GoalToolExecutor::handle(...)
               emit thread_goal_updated
 ```
 
-这就是当前对话里能看到 `get_goal/create_goal/update_goal` 工具的原因。它们不是普通 core tools，而是 goal extension 提供的模型工具。
+当前对话里能看到 `get_goal/create_goal/update_goal`，原因就是 goal extension 把它们注册成了模型工具。
 
 ### 6.4 goal 如何驱动自动继续
 
@@ -638,7 +638,7 @@ continue_if_idle()
   thread.try_start_turn_if_idle(vec![item])
 ```
 
-而 `continuation_steering_item` 不是普通用户文本，它会生成 `InternalContextSource("goal")` 的上下文片段：
+`continuation_steering_item` 会生成 `InternalContextSource("goal")` 的上下文片段：
 
 ```text
 goal objective / token usage / budget
@@ -653,7 +653,7 @@ InternalModelContextFragment(source="goal")
 作为下一轮模型输入
 ```
 
-所以 `/goal` 的完整意义是：
+`/goal` 的完整意义：
 
 ```text
 持久目标状态
@@ -665,7 +665,7 @@ InternalModelContextFragment(source="goal")
   + idle 时自动启动下一轮 turn
 ```
 
-它并没有替代 `run_turn`。它只是把“什么时候继续开始一个新 turn、给模型塞什么目标上下文、什么时候算完成/阻塞/预算耗尽”这几件事放到了 thread goal runtime 里。
+它不替代 `run_turn`。它把“什么时候继续开始一个新 turn、给模型塞什么目标上下文、什么时候算完成/阻塞/预算耗尽”放到 thread goal runtime 里。
 
 ## 7. `/goal` 和 `update_plan` 的区别
 
@@ -703,7 +703,7 @@ goal 是“这个线程长期要完成什么”
    - 这里直接影响“继续干活”的语气和边界。
 
 3. `core/src/session/turn.rs` 的 compaction 分支
-   - 长任务不是只靠 goal，还靠 mid-turn auto compact 保持上下文可用。
+   - 长任务还靠 mid-turn auto compact 保持上下文可用。
 
 4. `core/src/tools/registry.rs` 和 hook runtime
    - handler 前后的 pre/post hook 是权限、审计、改写输入的重要切点。
@@ -715,7 +715,7 @@ goal 是“这个线程长期要完成什么”
    - pending input、slash command、goal continuation 怎样避免互相踩。
 
 7. `core/tests/suite` 和 `ext/goal/tests`
-   - 真正验证 agent loop 的方式不是 mock handler，而是假模型响应 + 真实 runtime。
+   - agent loop 的关键验证方式是假模型响应 + 真实 runtime。
 
 ## 9. 最短源码阅读路线
 

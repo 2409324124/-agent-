@@ -11,10 +11,10 @@
 
 结论先放前面：
 
-- 这套能力主要不是旧 `shell_command`，而是 `unified_exec` 的 `exec_command` + `write_stdin`。
+- 后台长任务主要走 `unified_exec` 的 `exec_command` + `write_stdin`。
 - `exec_command` 初次启动进程，只等 `yield_time_ms` 这么久；如果进程还活着，就返回 `session_id`。
 - 活进程被放进 `UnifiedExecProcessManager` 的 `ProcessStore`，不会因为本轮工具调用返回就被杀掉。
-- `write_stdin({ session_id, chars: "" })` 是“空输入轮询”，不是给进程写东西；它会取最近输出，顺便判断进程是否还活着。
+- `write_stdin({ session_id, chars: "" })` 是“空输入轮询”：只取最近输出，并刷新进程状态。
 - `start_streaming_output` 和 `spawn_exit_watcher` 是后台监听的两条异步线：一条持续发增量输出，一条等进程退出后发最终结束事件。
 - TUI 的 `/ps`、`/stop` 只是这套进程表的 UI 管理入口。
 - 本次动态验证真实启动了 YOLOv8 麻将训练：`exec_command` 返回 `session_id=90426`，随后用空 `write_stdin` 轮询到训练结束、GPU 负载和 checkpoint 输出。
@@ -70,11 +70,12 @@ UnifiedExecProcessManager::write_stdin
         `-- exited       -> 返回 process_id: None + exit_code
 ```
 
-一句话：
+核心机制：
 
 ```text
-不是 Codex 卡在命令那里等几个小时。
-是命令进了进程表，Codex 每次只取一段输出，下一轮再按 session_id 轮询。
+命令进入进程表。
+Codex 每次只取一段输出。
+下一轮按 session_id 接回同一个后台进程。
 ```
 
 ## 2. 工具层：为什么会出现 session_id
@@ -129,7 +130,7 @@ yield_time_ms
 The model is trained on `session_id`.
 ```
 
-也就是说，模型习惯看到的是 `session_id`，内部管理表用的是 `process_id`。
+模型侧接口使用 `session_id`，内部管理表使用 `process_id`。
 
 ## 3. 初次启动：exec_command 如何把进程留下来
 
@@ -194,7 +195,7 @@ turn cannot drop the last Arc and terminate the background process.
 
 这句话解释了为什么长任务不会因为工具调用先返回而死掉：它在初次等待前就被放进 `ProcessStore`，有 manager 持有 `Arc<UnifiedExecProcess>`。
 
-## 4. 后台监听：输出不是等轮询时才读
+## 4. 后台监听：输出从进程启动时就开始读
 
 源码锚点：
 
@@ -222,7 +223,7 @@ tokio::spawn(async move {
 })
 ```
 
-这条线负责“边跑边看见输出”。注意它不是等 `write_stdin` 时才读输出，而是进程一启动就有 reader 在后台持续收 chunk。
+这条线负责“边跑边看见输出”。进程一启动，reader 就在后台持续收 chunk；`write_stdin` 只是把已经收集到的输出取出来。
 
 第二条：退出监听。
 
@@ -239,7 +240,7 @@ tokio::spawn(async move {
 
 这条线负责进程最终结束时发一个完整的 end event。它用 transcript 作为最终聚合输出来源。
 
-所以“后台监听”其实是：
+后台监听由四块组成：
 
 ```text
 live process
@@ -249,7 +250,7 @@ live process
   + process table entry
 ```
 
-不是一个单独的“监听命令”，而是一组 async task 和共享状态。
+它由 async task 和共享状态组成；没有额外的 shell 监听命令。
 
 ## 5. 轮询：write_stdin 空输入到底做了什么
 
@@ -315,7 +316,7 @@ UNIFIED_EXEC_OUTPUT_MAX_BYTES = 1 MiB
 MAX_UNIFIED_EXEC_PROCESSES = 64
 ```
 
-输出缓冲不是完整保存无限日志，而是 `HeadTailBuffer`：
+输出缓冲使用 `HeadTailBuffer`：
 
 ```text
 HeadTailBuffer
@@ -392,7 +393,7 @@ BackgroundTerminalInfo
   cwd
 ```
 
-这说明 `/ps` 看到的不是系统全局进程，而是 Codex 当前线程管理的 unified exec 后台进程。
+`/ps` 展示 Codex 当前线程管理的 unified exec 后台进程，不展示系统全局进程表。
 
 ## 8. 动态验证：这次真实跑到的现象
 
@@ -495,7 +496,7 @@ exec_command(command=..., yield_time_ms=1000)
   -> Process running with session ID 90426
 ```
 
-这一步证明的不是“命令已经结束”，而是：
+这一步证明：
 
 ```text
 YOLO 训练进程还活着。
@@ -565,7 +566,7 @@ Speed:
   weights/last.pt
 ```
 
-这就是“玩真的”的动态证据：
+动态证据：
 
 ```text
 真实 GPU 训练
@@ -654,7 +655,7 @@ empty write_stdin：
   需要时清理后台任务。
 ```
 
-这就是为什么你之前跑 SFT 时会感觉“Codex 很适合挂着看”：它不是一个 blocking shell，而是一个带 process table、输出缓冲、事件流和轮询工具的后台终端管理器。
+你之前跑 SFT 时会感觉“Codex 很适合挂着看”，原因就在这里：它是一个带 process table、输出缓冲、事件流和轮询工具的后台终端管理器。
 
 ## 10. 最短源码阅读路线
 

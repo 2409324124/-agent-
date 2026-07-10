@@ -134,9 +134,7 @@ codex -a never -s read-only -C /tmp/codex_dynamic_probe \
 | **底层拉起 (Spawn)** | `core/src/exec.rs`, `core/src/spawn.rs` |
 | **Agent 集成测试框架** | `core/tests/suite/tool_harness.rs` |
 
----
 
-这份文档你是打算留作个人的架构笔记，还是准备发在类似知乎专栏或 B 站专栏当技术文章？如果是后者，可能还需要在代码块和正文之间加一点引导语。
 
 ## 参考
 

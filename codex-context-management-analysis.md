@@ -29,6 +29,26 @@ base_instructions（人格提示词，developer）
 
 ## 1. 首轮上下文组装链路
 
+先把首轮发给模型的消息列表画成块（实测顺序，自上而下）：
+
+```text
+┌───────────────────────────────────────────────────────────────┐
+│ developer │ base_instructions（人格 + 工作规则，最大的一块）      │ ┐
+├───────────┼───────────────────────────────────────────────────┤ │
+│ developer │ <skills_instructions>   技能元数据清单（见 5.3）     │ │
+│ developer │ <multi_agent_role> / <multi_agent_mode>           │ ├ 固定前缀
+│ developer │ <app-context>（仅桌面版：图片/插件/computer-use）    │ │ 每轮不变
+├───────────┼───────────────────────────────────────────────────┤ │ → prompt
+│ user      │ <environment_context>   cwd / shell / 日期 / 权限   │ │   cache
+│ user      │ <recommended_plugins>（仅桌面版）                  │ │   98%+
+│ user      │ # AGENTS.md instructions <INSTRUCTIONS>…          │ │   命中
+├───────────┼───────────────────────────────────────────────────┤ ┘
+│ user      │ ★ 你的第一条消息                                   │ ← 可变部分从这里开始
+└───────────┴───────────────────────────────────────────────────┘
+注意：三块"系统信息"（环境/插件/AGENTS.md）借用了 user 角色下发
+```
+
+
 入口是 `Session::build_initial_context_with_world_state`（`core/src/session/mod.rs:4719`）。它不直接拼字符串，而是收集一堆 `RenderedFragment`，按 slot 分流：
 
 ```text
@@ -112,6 +132,22 @@ token_limit_reached == true
      跳过摘要，直接开新窗口）
 ```
 
+三道闸门的关系：
+
+```text
+token 用量一路上升
+      │
+      ▼
+ 闸门① scope 用量 ≥ auto_compact_token_limit + fallback_buffer?
+      │ 是 ──► 同步压缩（挡在当前回合里，实测约 34s）
+      ▼
+ 闸门② 全量 ≥ context_window × post_turn_compact_threshold_percent?
+      │ ──► 回合结束后压缩（不挡当前回合）
+      ▼
+ 闸门③ 全量 ≥ context_window × async_compaction_threshold_percent?
+        ──► 后台提前跑摘要，触顶时直接领养结果（不卡用户体验）
+```
+
 另有一条**异步后台压缩**（`session/async_compaction.rs:40`）：开了 `Feature::AsyncCompaction` 且 provider 支持 `RemoteCompactionSupport::V2` 时，用量超过 `async_compaction_threshold_percent` 就提前在后台跑摘要，等真正触顶时直接领养（adopt）已完成的结果——这就是为了消除"压缩卡住 30 秒"的体验问题。
 
 ## 3. 压缩执行：三条路径
@@ -132,6 +168,27 @@ token_limit_reached == true
 2. 用户消息按 `COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000`（`compact.rs:63`）的预算从新到旧选取，超预算就丢最老的；
 3. 摘要文本放在最后；
 4. `insert_initial_context_before_last_real_user_or_summary`（:650）把 initial context 重新插回——**优先插在最后一条真实用户消息之前**，没有用户消息就插在摘要之前，保证摘要/compaction 项永远在末尾。
+
+折叠过程画出来是这样：
+
+```text
+压缩前历史                          压缩后 replacement_history
+┌────────────────────────┐         ┌──────────────────────────┐
+│ 初始上下文骨架            │         │ additional_tools（工具声明重建）│
+├────────────────────────┤         │ developer 骨架（原样重建）    │
+│ user 消息 1             │ ──────► │ user 消息 1   ◄── 原文保留   │
+├────────────────────────┤  原样   ├──────────────────────────┤
+│ assistant 回复 1        │ ──┐ 搬移│ user 消息 2   ◄── 原文保留   │
+│ 工具调用 + 输出 1        │  │      │ …（预算 20k/64k，超限丢最老） │
+├────────────────────────┤  │ 折叠 ├──────────────────────────┤
+│ user 消息 2             │ ─┘      │ ┌──────────────────────┐ │
+├────────────────────────┤         │ │ compaction item       │ │
+│ assistant 回复 2        │ ──────► │ │ encrypted_content     │ │
+│ 工具调用 + 输出 2        │  摘要化  │ │ （Fernet 加密摘要，     │ │
+└────────────────────────┘         │ │  本地不可见，永远垫底） │ │
+                                   │ └──────────────────────┘ │
+                                   └──────────────────────────┘
+```
 
 远端 v2 的保留预算更大：`RETAINED_MESSAGE_TOKEN_BUDGET = 64_000`（`compact_remote_v2.rs:87`），由服务端决定折叠内容，客户端拿到的是 `ResponseItem::Compaction { encrypted_content }`——**摘要在本地不可见**（Fernet 加密，`gAAAAA…` 开头），rollout 里只能看到密文。
 
@@ -202,6 +259,19 @@ codex -c model_auto_compact_token_limit=12000 exec --sandbox danger-full-access 
 ### 5.3 端到端：Skill 的发现、注入与触发
 
 在 `~/.codex/skills/test-echo-skill/SKILL.md` 放一个带暗号的测试技能（frontmatter 含 name/description），`codex exec '测试技能'` 模型直接答出暗号 `PINEAPPLE-777`。rollout 揭示 skill 机制是**渐进披露（progressive disclosure）**：
+
+```text
+        首轮上下文（进 prompt）              运行时才发生（不进首轮）
+┌────────────────────────────────┐
+│ <skills_instructions>           │        模型判定相关
+│   skill roots 表 (r0~r4)        │  ──────────────────►  exec: Get-Content
+│   ──────────────────            │                          SKILL.md 全文
+│   imagegen:      50 tokens 元数据│                              │
+│   test-echo-skill: 50 tokens    │  ◄──────────────────   正文作为工具输出
+│   …每条只有 name+description    │    "当用户说'测试技能'时…"      进入历史
+└────────────────────────────────┘                              │
+        成本：O(技能数 × 50)                指令生效：回复 PINEAPPLE-777
+```
 
 1. **首轮只注入元数据**：`<skills_instructions>`（developer 角色）里只有 skill 名称 + description + skill roots 表：
    ```text

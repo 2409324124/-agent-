@@ -9,6 +9,7 @@
 - [Codex Harness 源码解析：JSON 如何变成 shell 执行](./codex-harness-source-analysis.md)
 - [Codex Handler / Loop / Goal 源码解析：agent 如何持续做事](./codex-loop-handler-goal-analysis.md)
 - [Codex 后台监听机制解析：长任务为什么能挂着跑](./codex-background-exec-monitoring.md)
+- [Codex 上下文管理源码解析：首轮上下文拼装与压缩折叠](./codex-context-management-analysis.md)
 - [opencode 运行期开销实测与 TypeScript 高性能开发笔记](docs/opencode-runtime-performance.md)
 
 ---

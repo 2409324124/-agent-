@@ -285,6 +285,38 @@ codex -c model_auto_compact_token_limit=12000 exec --sandbox danger-full-access 
 2. **按需读正文**：模型判断相关后才用 shell 读 `SKILL.md` 全文（rollout 里有对应 Get-Content 调用），正文不进首轮上下文——这正是 skills 对上下文友好的关键设计。
 3. 触发判定靠 description 写得是否命中场景；frontmatter 校验见 `skills/src/parser.rs:43`。
 
+### 5.4 端到端：代码仓库阅读中的渐进式披露
+
+实验：让 codex 在 `openai/codex` 源码树上回答"自动压缩的触发判定逻辑在哪个文件哪个函数"（只读）。它 3 步就给出了正确答案（`context_window.rs:56` 等），rollout 揭示的阅读策略是**逐层收窄**：
+
+```text
+第 0 层  首轮上下文里只有 skills 元数据（name+desc，~50 tokens/条）
+   │ 模型判定 investigate-codebase 技能相关
+   ▼ exec: Get-Content SKILL.md                    ← 按需加载技能正文
+第 1 层  技能正文里提到 references/ 下的追踪手册
+   ▼ exec: Get-Content references/trace-runtime-…  ← 二级文件再按需加载
+第 2 层  广角搜索：rg 'auto.?compact|…' 全仓扫
+   │      输出 43,233 chars（触发截断）              ← 粗扫，噪声大、有截断保护
+   ▼
+第 3 层  定向整读：Get-Content context_window.rs    ← grep 定位后才读整个文件
+   ▼
+第 4 层  行级切片：$c[175..215]; $c[620..710]       ← 最后只精读关键行
+```
+
+对应的上下文增长曲线（`token_count` 实测）：
+
+```text
+19,691 ──► 30,632 ──► 34,289 ──► 37,725 input tokens
+ 首轮      +10.9k      +3.7k      +3.4k
+ 骨架      粗扫结果    整读文件    行级精读
+```
+
+渐进式披露在此体现为三条互补的机制：
+
+1. **Skills**：首轮只给元数据 → 正文按需读 → references 二级文件再按需读；
+2. **仓库阅读**：rg 列名字（cheap）→ 整读命中的文件 → 行号切片精读，成本始终花在已经确认相关的内容上；
+3. **截断兜底**：单次工具输出超限会被截断（43k chars 那次），防止一次粗扫把窗口打爆——配置项 `tool_output_token_limit`。
+
 **Windows 沙箱注意点**：本机默认 read-only 沙箱下 exec 报 `CreateProcessWithLogonW failed: 1385`（受限令牌登录失败），需 `--sandbox danger-full-access` 或桌面版 config 里的 `[windows] sandbox = "elevated"`。
 
 ## 6. 可调配置（config.toml）

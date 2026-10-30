@@ -1,0 +1,136 @@
+{
+  "message": "",
+  "replacement_history_metadata": [
+    {
+      "client_authored": false
+    },
+    {
+      "client_authored": false
+    },
+    {
+      "client_authored": false
+    },
+    {
+      "client_authored": false
+    },
+    {
+      "client_authored": false
+    },
+    {
+      "client_authored": false
+    },
+    {
+      "retained_source": {
+        "id": {
+          "message_id": "msg_<uuid>",
+          "turn_id": "<uuid>",
+          "role": "user"
+        },
+        "revision": "retained_<uuid>",
+        "complete": true
+      },
+      "client_authored": false,
+      "user_input_order": 0,
+      "mcp_attribution": {
+        "status": "none"
+      }
+    },
+    {
+      "client_authored": false,
+      "compaction_model_hash": "3000",
+      "mcp_attribution": {
+        "status": "none"
+      }
+    }
+  ],
+  "retained_context": {
+    "verified_answers": [],
+    "incomplete": false,
+    "user_messages": [
+      {
+        "revision": "retained_<uuid>",
+        "order": 0,
+        "turn_id": "<uuid>",
+        "message_id": "msg_<uuid>",
+        "text": "请记住数字 42，只回复一个字：好",
+        "complete": true
+      }
+    ],
+    "user_messages_incomplete": false,
+    "assistant_messages": [
+      {
+        "revision": "retained_<uuid>",
+        "order": 1,
+        "turn_id": "<uuid>",
+        "message_id": "msg_<id>",
+        "text": "好",
+        "complete": true,
+        "phase": "final_answer"
+      }
+    ],
+    "assistant_messages_incomplete": false,
+    "next_order": 3
+  },
+  "window_number": 1,
+  "first_window_id": "<uuid>",
+  "previous_window_id": "<uuid>",
+  "window_id": "<uuid>",
+  "compaction_response_id": "resp_<id>",
+  "latest_token_usage_record": {
+    "thread_id": "<uuid>",
+    "turn_id": "<uuid>",
+    "session_id": "<uuid>",
+    "root_turn_id": "<uuid>",
+    "response_id": "resp_<id>",
+    "usage": {
+      "input_tokens": 18300,
+      "cached_input_tokens": 18048,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 37,
+      "reasoning_output_tokens": 0,
+      "total_tokens": 18337
+    },
+    "turn_token_usage": {
+      "input_tokens": 18300,
+      "cached_input_tokens": 18048,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 37,
+      "reasoning_output_tokens": 0,
+      "total_tokens": 18337
+    },
+    "thread_token_usage": {
+      "input_tokens": 36575,
+      "cached_input_tokens": 18048,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 42,
+      "reasoning_output_tokens": 0,
+      "total_tokens": 36617
+    }
+  },
+  "resume_metadata": {
+    "dynamic_tools": {
+      "thread_id": "<uuid>",
+      "tools": []
+    },
+    "multi_agent_version": "v2",
+    "last_started_turn_id": "<uuid>",
+    "turn_attribution": {
+      "turn_id": "<uuid>",
+      "turn_trigger": "exec",
+      "parent_turn_id": null,
+      "initiating_agent_path": null,
+      "root_turn_id": "<uuid>"
+    },
+    "previous_turn_settings": {
+      "model": "gpt-6.1-terra",
+      "cyber_access_program": "standard",
+      "comp_hash": "3000",
+      "realtime_active": false
+    }
+  },
+  "replacement_history": "<8 items: additional_tools/developer, compaction/None, message/developer, message/user>",
+  "last_item": {
+    "type": "compaction",
+    "encrypted_content": "gAAAAABq5AZMXxGzr_6evmy6qpDQ5CwMRyKbVy0f0TKikzFZRyQHaR7oGkWZ…(1932 chars total, Fernet 加密)"
+  }
+}

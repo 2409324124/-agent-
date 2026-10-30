@@ -388,6 +388,33 @@ user 卡：    你的第一条消息
 | `instructions` / `developer_instructions` | 注入首轮上下文 |
 | `project_doc_max_bytes` | AGENTS.md 截断上限 |
 
+## 附录 A：原始 payload（脱敏实测样本）
+
+以下文件是从本机真实会话 rollout（`~/.codex/sessions/*.jsonl`）提取的原始记录，已脱敏（用户名 → `<you>`，会话/消息 ID → `<id>`/`<uuid>`）：
+
+- [examples/first-turn-cli.txt](examples/first-turn-cli.txt)（70KB）：CLI 首轮完整原始信息——**完整 base_instructions 人格提示词原文** + 首轮每条消息的原始 payload（skills_instructions / multi_agent_role / environment_context / AGENTS.md 注入）
+- [examples/first-turn-desktop.txt](examples/first-turn-desktop.txt)（29KB）：桌面版首轮原始信息——base_instructions + `<app-context>` + `<recommended_plugins>` 等桌面版专属卡片
+- [examples/compacted-record.json](examples/compacted-record.json)（4KB）：一次真实压缩的 `compacted` 记录骨架——`replacement_history` 构成、`retained_context`、`window_id` 链、加密摘要项（密文截断展示）
+
+节选预览——environment_context 原始样子：
+
+```xml
+<environment_context>
+  <cwd>C:\Users\<you>\work\agent-analysis\codex-src</cwd>
+  <shell>powershell</shell>
+  <current_date>2026-10-30</current_date>
+  <timezone>Asia/Shanghai</timezone>
+  <filesystem><workspace_roots><root>C:\Users\<you>\work\agent-analysis\codex-src</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
+</environment_context>
+```
+
+压缩记录尾部（摘要项永远垫底，密文本地不可读）：
+
+```json
+{"type": "compaction", "id": "cmp_<id>",
+ "encrypted_content": "gAAAAABq5AZMXxGzr_6evmy6qpDQ5CwMRyKbVy0f0TKikzFZ…(Fernet 加密)"}
+```
+
 ## 8. 限制与版本差异
 
 - 摘要内容走服务端加密（远端 v2），本地无法审计摘要质量；本地路径（`compact.rs`）的摘要是明文。

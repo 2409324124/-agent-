@@ -319,7 +319,65 @@ codex -c model_auto_compact_token_limit=12000 exec --sandbox danger-full-access 
 
 **Windows 沙箱注意点**：本机默认 read-only 沙箱下 exec 报 `CreateProcessWithLogonW failed: 1385`（受限令牌登录失败），需 `--sandbox danger-full-access` 或桌面版 config 里的 `[windows] sandbox = "elevated"`。
 
-## 6. 可调配置（config.toml）
+## 6. 设计哲学：三层机制如何串成一套体系
+
+看完实现细节，退一步看全貌。Codex 上下文管理的总纲是一句话：
+
+> **上下文是稀缺资源，任何东西默认不进上下文；模型证明"我需要它"之后，它才进。**
+
+三层机制都是这一条的展开：
+
+### 第一层：首轮拼装——骨架先行，正文后置
+
+首轮发给模型的不是一个大提示词，而是一叠分层卡片（`core/src/context/` 的 50+ 种 fragment）：
+
+```text
+developer 卡：人格规则（base_instructions）
+developer 卡：技能清单（只有 name+简介，每条 ~50 tokens）
+developer 卡：多 agent 协作规则
+user 卡：    环境信息（cwd/shell/日期/权限）
+user 卡：    AGENTS.md 内容
+user 卡：    你的第一条消息
+```
+
+两个关键设计：
+
+1. **系统信息借 user 角色下发**（environment_context、AGENTS.md 都是 user 消息），让模型在"不可信等级"上区分：developer > user，AGENTS.md 里写的东西权威性低于系统规则；
+2. **前缀绝对稳定**——卡片顺序与内容每轮不变，实测 98.4% 输入 token 命中 prompt cache。
+
+### 第二层：渐进披露——先给目录，正文自取
+
+同一个套路用在三个地方：
+
+- **Skills**：首轮只注入 name+description → 模型判定相关才读 `SKILL.md` 正文 → 正文里引用的 `references/` 再按需读（5.3、5.4 实测）；
+- **仓库阅读**：rg 列候选（cheap）→ 整读命中文件 → 行号切片精读，成本始终花在已确认相关的内容上（5.4 实测 token 曲线 19.7k → 37.7k，3000+ 文件的仓库最终只有 3 个文件的片段进入上下文）；
+- **截断兜底**：单次工具输出超 `tool_output_token_limit` 预算被硬截断，防止一次粗扫打爆窗口。
+
+### 第三层：压缩——用户的话一字不动，自己的草稿可折叠
+
+```text
+压缩前历史                    压缩后
+├ 骨架（环境/技能/规则）      ├ 骨架：原样重建（保住缓存）
+├ 用户消息 1                  ├ 用户消息 1 ── 原文保留
+├ 助手回复 1                  ├ 用户消息 2 ── 原文保留
+├ 工具输出 1        折叠为    ├ compaction 项（加密摘要，垫底）
+├ 用户消息 2                  └
+└ 助手回复 2
+```
+
+实测：强制压缩后追问之前让记的数字，模型答出 "42，7"——用户消息原文从未离开上下文；助手自己的中间过程折叠成 Fernet 加密摘要，服务端生成、本地不可见。
+
+### 三层各省什么
+
+| 层 | 省的是什么 |
+|---|---|
+| 首轮拼装 | **每一轮**的钱：前缀稳定 → 缓存命中 |
+| 渐进披露 | **不必要**的信息：按需加载 |
+| 压缩折叠 | **无限长**会话：有损折叠，但保住用户意图 |
+
+统一判断标准：对 coding agent，上下文里最值钱的是"用户说过什么"，最不值钱的是"我中间试过什么"。所以前者永存原文，后者可以压成摘要。
+
+
 
 | 键 | 作用 |
 |---|---|
@@ -330,7 +388,7 @@ codex -c model_auto_compact_token_limit=12000 exec --sandbox danger-full-access 
 | `instructions` / `developer_instructions` | 注入首轮上下文 |
 | `project_doc_max_bytes` | AGENTS.md 截断上限 |
 
-## 7. 限制与版本差异
+## 8. 限制与版本差异
 
 - 摘要内容走服务端加密（远端 v2），本地无法审计摘要质量；本地路径（`compact.rs`）的摘要是明文。
 - 用户消息保留预算 20k（本地）/ 64k（远端 v2），超长会话里最老的用户消息照样会丢——"永不压缩"是有预算的。
